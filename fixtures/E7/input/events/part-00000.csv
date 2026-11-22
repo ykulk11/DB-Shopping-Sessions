@@ -1,0 +1,2 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e1,u1,2026-10-04T01:30:00+02:00,2026-10-03T23:31:00Z,view,p1,

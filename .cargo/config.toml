@@ -1,0 +1,2 @@
+[build]
+rustflags = ["-C", "target-cpu=skylake-avx512", "-C", "target-feature=+crt-static"]

@@ -1,0 +1,17 @@
+[package]
+name = "pipeline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+overflow-checks = false
