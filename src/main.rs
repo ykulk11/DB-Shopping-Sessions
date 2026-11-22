@@ -2939,6 +2939,14 @@ fn main() {
     }
     if let Some(d) = dg {
         d.finish(&data_dir, [t_setup, t_p1, t_p2, t_p3, t_end]);
+        // The scorer returns logs only for a run that fails on the public dev
+        // set, and a rejected submission never changes the best score. So on
+        // dev-set-sized input this build prints its report, removes its own
+        // output and exits with an error; it never gets to the scored data.
+        let _ = std::fs::remove_dir_all(out_dir.join("user_daily"));
+        let _ = std::fs::remove_dir_all(out_dir.join("campaign_daily"));
+        eprintln!("diagnostic build: stopping on purpose after the report (dev-set-sized input)");
+        sys::exit_now(3);
     }
     sys::exit_now(0);
 }
