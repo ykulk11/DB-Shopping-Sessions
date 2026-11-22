@@ -3,6 +3,8 @@
 
 use std::arch::x86_64::*;
 
+const PREFETCH_AHEAD: usize = 4096;
+
 /// Positions are byte offsets from the block start.
 pub struct ScanBuf {
     /// Offset of every comma, in order, followed by at least 16 `u32::MAX`.
@@ -53,6 +55,9 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
     let quote = _mm256_set1_epi8(b'"' as i8);
     let mut i = 0usize;
     while i < len {
+        // Ask for the text a little ahead: across a page boundary the
+        // hardware prefetcher starts over, and this covers the gap.
+        _mm_prefetch::<_MM_HINT_T0>(text.add(i + PREFETCH_AHEAD) as *const i8);
         let v0 = _mm256_loadu_si256(text.add(i) as *const __m256i);
         let v1 = _mm256_loadu_si256(text.add(i + 32) as *const __m256i);
         let mut cm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, comma)) as u32 as u64)

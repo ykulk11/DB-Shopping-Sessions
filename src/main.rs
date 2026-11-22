@@ -26,7 +26,7 @@ use hash::{hash128, StaticTable};
 use sys::{Arena, Mapped};
 use ts::{BAD, DAY_MS};
 
-const BLOCK: usize = 64 << 10;
+const BLOCK: usize = 32 << 10;
 const CHUNK: usize = 2 << 20;
 const GAP_MS: u32 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
@@ -258,13 +258,39 @@ impl<T: Copy> Wc<T> {
         }
     }
 
+    /// Calls `f` for each record of a partition. The blocks are scattered
+    /// pages, so each block's successor is requested line by line while the
+    /// current one is read.
     #[inline(always)]
     unsafe fn for_each(&self, part: usize, mut f: impl FnMut(*mut T)) {
-        self.for_each_block(part, |base, n| {
-            for i in 0..n {
-                f(base.add(i));
+        let h = *self.heads.get_unchecked(part);
+        let total = h.cnt as usize;
+        if total == 0 {
+            return;
+        }
+        let nb = (total + Self::PER_BLOCK - 1) / Self::PER_BLOCK;
+        let mut n = total - (nb - 1) * Self::PER_BLOCK;
+        let mut bi = h.last;
+        while bi != u32::MAX {
+            let b = *self.blocks.get_unchecked(bi as usize);
+            let base = b.ptr as *mut T;
+            if b.prev != u32::MAX {
+                let next = self.blocks.get_unchecked(b.prev as usize).ptr;
+                let per_line = Self::PER_LINE as usize;
+                for i in 0..n {
+                    if i % per_line == 0 {
+                        prefetch(next.add(i * Self::SZ));
+                    }
+                    f(base.add(i));
+                }
+            } else {
+                for i in 0..n {
+                    f(base.add(i));
+                }
             }
-        });
+            bi = b.prev;
+            n = Self::PER_BLOCK;
+        }
     }
 }
 
@@ -995,6 +1021,7 @@ unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
         if total == 0 {
             continue;
         }
+        // Between a quarter and half full.
         let tsize = (total * 2).next_power_of_two().max(64);
         if table.len() < tsize {
             table = vec![0u64; tsize];
@@ -1084,6 +1111,10 @@ unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &At
         for i in 0..used {
             if i + 16 < used {
                 sh.intern.prefetch_person((*base.add(i + 16)).uidx);
+            }
+            if i % 4 == 0 {
+                // One page ahead in the row store.
+                prefetch(base.add(i + 256) as *const u8);
             }
             let r = *base.add(i);
             let is_pur = pcur < pur.len() && pur.get_unchecked(pcur).0 == first + i as u32;
@@ -1675,17 +1706,33 @@ fn main() {
     let campaigns_map = sys::map_file(&data_dir.join("campaigns.csv"));
     let product_rows = unsafe { lookup_rows(&products_map) };
     let campaign_rows = unsafe { lookup_rows(&campaigns_map) };
-    let mut cat_names: Vec<Vec<u8>> = product_rows.iter().map(|r| r.1.to_vec()).collect();
-    cat_names.push(b"unknown".to_vec());
-    cat_names.sort();
-    cat_names.dedup();
-    if cat_names.len() > 256 {
-        sys::die("more than 255 categories");
+    // The distinct categories (a handful) plus "unknown", numbered in byte order.
+    let mut cat_names: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
+    let mut seen = StaticTable::new(256);
+    for (_, cat) in &product_rows {
+        let h = unsafe { hash128(cat.as_ptr(), cat.len()) };
+        if seen.get(h).is_none() {
+            seen.insert(h, 0);
+            if !cat_names.iter().any(|c| c.as_slice() == *cat) {
+                cat_names.push(cat.to_vec());
+            }
+            if cat_names.len() > 256 {
+                sys::die("more than 255 categories");
+            }
+        }
     }
-    let unknown_cat = cat_names.binary_search(&b"unknown".to_vec()).unwrap() as u32;
+    cat_names.sort();
+    let unknown_cat = cat_names.iter().position(|c| c.as_slice() == b"unknown").unwrap() as u32;
+    let mut cat_rank = StaticTable::new(256);
+    for (i, c) in cat_names.iter().enumerate() {
+        // Hashing reads up to 16 bytes past the name: give it room.
+        let mut padded = c.clone();
+        padded.extend_from_slice(&[0u8; 64]);
+        cat_rank.insert(unsafe { hash128(padded.as_ptr(), c.len()) }, i as u32);
+    }
     let mut products = StaticTable::new(product_rows.len());
     for (id, cat) in &product_rows {
-        let c = cat_names.binary_search(&cat.to_vec()).unwrap() as u32;
+        let c = cat_rank.get(unsafe { hash128(cat.as_ptr(), cat.len()) }).unwrap();
         products.insert(unsafe { hash128(id.as_ptr(), id.len()) }, c);
     }
     let mut campaigns = StaticTable::new(campaign_rows.len());
