@@ -1390,10 +1390,238 @@ impl DedupTable {
     }
 }
 
+// The dedup works in two levels. A partition's fingerprints are spread over
+// 2^k sub-buckets by the top bits of their tag (which neither the partition
+// nor a table index uses), about SUB_ROWS each, keeping their order. Copies
+// of one event share their tag, so they meet in one sub-bucket in the order
+// a table over the whole partition sees them, and every decision is the one
+// it makes. Each sub-bucket is then settled in a small table that stays in L1.
+
+/// A sub-bucket table has 2^11 4-byte slots: 8 KB.
+const SUB_SLOT_BITS: u32 = 11;
+const SUB_SLOTS: usize = 1 << SUB_SLOT_BITS;
+/// A slot holds the row's position in its sub-bucket in its low 10 bits, so
+/// a sub-bucket holds at most 2^10 rows and its table is at most half full.
+const SUB_POS_BITS: u32 = 10;
+const SUB_POS_MASK: u32 = (1 << SUB_POS_BITS) - 1;
+/// Above the position, tag bits 10 to 23 in place (the table index is bits
+/// 0 to 10), and above them the generation, in the top 8 bits.
+const SUB_TAG_MASK: u32 = ((1 << (24 - SUB_POS_BITS)) - 1) << SUB_POS_BITS;
+const SUB_GEN: u32 = 1 << 24;
+/// Rows per sub-bucket aimed at (its table is then at most about 1/8 full),
+/// and at most 2^8 sub-buckets per partition.
+const SUB_ROWS: usize = 256;
+const SUB_MAX_BITS: u32 = 8;
+
+/// The tag bits and position part of a slot, for a row with tag `tag` whose
+/// position in the sub-bucket plus the current generation is `pos_gen`.
+#[inline(always)]
+fn sub_key(tag: u32, pos_gen: u32) -> u32 {
+    (tag & SUB_TAG_MASK) | pos_gen
+}
+
+/// The first row of every row-store chunk by the top bits of a row reference
+/// (thread number + 1 and chunk), so a row is one load away rather than two.
+struct RowIndex {
+    first: Vec<*mut Row>,
+}
+
+impl RowIndex {
+    fn new(p1: &[P1]) -> Self {
+        let mut first = vec![std::ptr::null_mut(); (p1.len() + 1) << 10];
+        for (t, th) in p1.iter().enumerate() {
+            for (c, &(p, _)) in th.rows.chunks.iter().enumerate() {
+                first[((t + 1) << 10) | c] = p;
+            }
+        }
+        RowIndex { first }
+    }
+
+    #[inline(always)]
+    unsafe fn row(&self, r: u32) -> *mut Row {
+        (*self.first.get_unchecked((r >> ROW_BITS) as usize)).add((r & (ROW_CHUNK as u32 - 1)) as usize)
+    }
+}
+
+/// The hash table of one sub-bucket. A slot of an older generation counts as
+/// empty, so a new sub-bucket only bumps the generation; the slots are zeroed
+/// once every 255 sub-buckets.
+struct SubTable {
+    /// SUB_SLOTS slots, and one more that takes the stores of rows that go
+    /// to `pending`, so the common path has no branch around its store.
+    slots: Vec<u32>,
+    /// The current generation, in the top 8 bits.
+    gen: u32,
+    /// `slot << SUB_POS_BITS | position` of rows that look like copies of an earlier one.
+    pending: Vec<u32>,
+}
+
+impl SubTable {
+    fn new() -> Self {
+        SubTable { slots: vec![0; SUB_SLOTS + 1], gen: 0, pending: Vec::new() }
+    }
+
+    /// Settles one sub-bucket, `arr[..len]` in arrival order (`len <= 2^SUB_POS_BITS`):
+    /// of the rows with one event_id the one with the smallest ingest_ts stays,
+    /// the others get their `tsv` cleared.
+    #[inline(never)]
+    unsafe fn dedup(&mut self, p1: &[P1], rows: &RowIndex, arr: *const u64, len: usize) {
+        if self.gen == 255 * SUB_GEN {
+            self.slots.fill(0);
+            self.gen = 0;
+        }
+        self.gen += SUB_GEN;
+        let gen = self.gen;
+        let tab = self.slots.as_mut_ptr();
+        let mask = SUB_SLOTS - 1;
+        self.pending.clear();
+        self.pending.reserve(len);
+        let pend = self.pending.as_mut_ptr();
+        let mut np = 0usize;
+        // The tag is the high half of a fingerprint: little-endian, the second u32.
+        // `kp`, the generation plus the row's position, is both the slot's
+        // low part and the loop counter: row kp's tag is `tags[2 * kp]`.
+        let tags = (arr as *const u32).wrapping_add(1).wrapping_sub(2 * gen as usize);
+        let end = gen as usize + len;
+        let mut kp = gen as usize;
+        while kp != end {
+            let tag = *tags.wrapping_add(2 * kp);
+            let key = sub_key(tag, kp as u32);
+            // `tag & mask` without a copy of `tag`.
+            let mut i = std::arch::x86_64::_bzhi_u32(tag, SUB_SLOT_BITS) as usize;
+            let mut s = *tab.add(i);
+            if s >= gen {
+                // The slot is taken (by about 1 row in 10): walk on.
+                std::hint::cold_path();
+                loop {
+                    if (s ^ key) >> SUB_POS_BITS == 0 {
+                        // The same generation and 14 tag bits: compare the whole tag.
+                        let fa = *arr.add((s & SUB_POS_MASK) as usize);
+                        if (fa >> 32) as u32 == tag {
+                            // Probably a copy of the same event. The rows are far
+                            // away: ask for them now and settle it after the sub-bucket.
+                            let pos = kp as u32 - gen;
+                            prefetch(rows.row(fa as u32) as *const u8);
+                            prefetch(rows.row(*arr.add(pos as usize) as u32) as *const u8);
+                            *pend.add(np) = ((i as u32) << SUB_POS_BITS) | pos;
+                            np += 1;
+                            i = SUB_SLOTS;
+                            break;
+                        }
+                    }
+                    i = (i + 1) & mask;
+                    s = *tab.add(i);
+                    if s < gen {
+                        break;
+                    }
+                }
+            }
+            *tab.add(i) = key;
+            kp += 1;
+        }
+        for q in 0..np {
+            let e = *pend.add(q);
+            let pos = e & SUB_POS_MASK;
+            let mut i = (e >> SUB_POS_BITS) as usize;
+            let fb = *arr.add(pos as usize);
+            let tag = (fb >> 32) as u32;
+            let key = sub_key(tag, gen | pos);
+            loop {
+                let s = *tab.add(i);
+                if s < gen {
+                    *tab.add(i) = key;
+                    break;
+                }
+                if (s ^ key) >> SUB_POS_BITS == 0 {
+                    let fa = *arr.add((s & SUB_POS_MASK) as usize);
+                    if (fa >> 32) as u32 == tag {
+                        let a = rows.row(fa as u32);
+                        let b = rows.row(fb as u32);
+                        if (*a).h2 == (*b).h2 {
+                            let (ia, ib) = ((*a).ing, (*b).ing);
+                            let b_first = if ia == ib && (ia == 0 || ia == u32::MAX - 1) {
+                                exact_ingest(p1, fb as u32) < exact_ingest(p1, fa as u32)
+                            } else {
+                                ib < ia
+                            };
+                            if b_first {
+                                (*a).tsv = 0;
+                                *tab.add(i) = key;
+                            } else {
+                                (*b).tsv = 0;
+                            }
+                            break;
+                        }
+                    }
+                }
+                i = (i + 1) & mask;
+            }
+        }
+    }
+}
+
+/// The dedup of a partition that does not spread evenly over sub-buckets
+/// (many copies of one event, or more rows than they have room for): one
+/// table per partition, or per split of a big one.
+#[cold]
+#[inline(never)]
+unsafe fn dedup_wide(sh: &Shared, p1: &[P1], item: usize, total: usize, table: &mut DedupTable, buckets: &mut Vec<Vec<u64>>) {
+    if total <= sh.split_rows {
+        table.reset(total);
+        for t in p1 {
+            t.fp.for_each(item, |q| table.insert(p1, *q));
+        }
+        table.resolve(p1);
+        return;
+    }
+    // A big partition: split it on the top bits of the tag (which neither
+    // the partition nor the table index uses) so each table stays in cache.
+    let mut bits = 1u32;
+    while bits < 6 && (total >> bits) > sh.split_rows {
+        bits += 1;
+    }
+    let nb = 1usize << bits;
+    if buckets.len() < nb {
+        buckets.resize_with(nb, Vec::new);
+    }
+    for b in buckets[..nb].iter_mut() {
+        b.clear();
+        b.reserve(total);
+    }
+    let bp = buckets.as_mut_ptr();
+    for t in p1 {
+        t.fp.for_each(item, |q| {
+            let fp = *q;
+            let b = &mut *bp.add((fp >> (64 - bits)) as usize);
+            let n = b.len();
+            *b.as_mut_ptr().add(n) = fp;
+            b.set_len(n + 1);
+        });
+    }
+    for b in buckets[..nb].iter() {
+        if !b.is_empty() {
+            table.reset(b.len());
+            for &fp in b.iter() {
+                table.insert(p1, fp);
+            }
+            table.resolve(p1);
+        }
+    }
+}
+
 unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
     let pe = 1usize << sh.pe_bits;
+    let aim = sh.split_rows.min(SUB_ROWS);
+    let rows = RowIndex::new(p1);
+    let mut sub = SubTable::new();
     let mut table = DedupTable { slots: Vec::new(), mask: 0, pending: Vec::new() };
     let mut buckets: Vec<Vec<u64>> = Vec::new();
+    // The sub-buckets, one after another, the address each is written up
+    // to, and the address its room ends at.
+    let mut buf: Vec<u64> = Vec::new();
+    let mut wp = [0usize; 1 << SUB_MAX_BITS];
+    let mut lim = [0usize; 1 << SUB_MAX_BITS];
+    let mut blocks: Vec<(*mut u64, usize)> = Vec::new();
     loop {
         let item = next.fetch_add(1, Ordering::Relaxed);
         if item >= pe {
@@ -1403,45 +1631,79 @@ unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
         if total == 0 {
             continue;
         }
-        if total <= sh.split_rows {
-            table.reset(total);
-            for t in p1 {
-                t.fp.for_each(item, |q| table.insert(p1, *q));
-            }
-            table.resolve(p1);
-            continue;
-        }
-        // A big partition: split it on the top bits of the tag (which neither
-        // the partition nor the table index uses) so each table stays in cache.
         let mut bits = 1u32;
-        while bits < 6 && (total >> bits) > sh.split_rows {
+        while bits < SUB_MAX_BITS && (total >> bits) > aim {
             bits += 1;
         }
         let nb = 1usize << bits;
-        if buckets.len() < nb {
-            buckets.resize_with(nb, Vec::new);
+        let avg = (total + nb - 1) >> bits;
+        // Room for far more rows than a random spread ever puts in one
+        // sub-bucket. Each also has a block's worth of slack beyond it, so a
+        // whole block can be spread before the room is checked.
+        let room = avg + avg / 2 + 64;
+        if room > 1 << SUB_POS_BITS {
+            dedup_wide(sh, p1, item, total, &mut table, &mut buckets);
+            continue;
         }
-        for b in buckets[..nb].iter_mut() {
-            b.clear();
-            b.reserve(total);
+        // An odd number of cache lines apart, so that the sub-buckets' write
+        // fronts fall in different cache sets.
+        let stride = ((room + Wc::<u64>::PER_BLOCK).div_ceil(8) | 1) * 8;
+        buf.reserve(nb * stride);
+        let base = buf.as_mut_ptr();
+        for b in 0..nb {
+            let w = base.add(b * stride) as usize;
+            *wp.get_unchecked_mut(b) = w;
+            *lim.get_unchecked_mut(b) = w + room * size_of::<u64>();
         }
-        let bp = buckets.as_mut_ptr();
+        blocks.clear();
         for t in p1 {
-            t.fp.for_each(item, |q| {
-                let fp = *q;
-                let b = &mut *bp.add((fp >> (64 - bits)) as usize);
-                let n = b.len();
-                *b.as_mut_ptr().add(n) = fp;
-                b.set_len(n + 1);
-            });
+            t.fp.for_each_block(item, |p, n| blocks.push((p, n)));
         }
-        for b in buckets[..nb].iter() {
-            if !b.is_empty() {
-                table.reset(b.len());
-                for &fp in b.iter() {
-                    table.insert(p1, fp);
+        let shift = 64 - bits;
+        let mut spread = true;
+        for k in 0..blocks.len() {
+            let (src, n) = *blocks.get_unchecked(k);
+            // The blocks are scattered pages: the next one is requested line
+            // by line while this one is read.
+            let ahead = if k + 1 < blocks.len() { blocks.get_unchecked(k + 1).0 } else { src };
+            let delta = (ahead as usize).wrapping_sub(src as usize);
+            let mut q = src;
+            let lines_end = src.add(n & !7);
+            while q != lines_end {
+                prefetch((q as usize).wrapping_add(delta) as *const u8);
+                for j in 0..8 {
+                    let fp = *q.add(j);
+                    let w = wp.get_unchecked_mut((fp >> shift) as usize);
+                    *(*w as *mut u64) = fp;
+                    *w += size_of::<u64>();
                 }
-                table.resolve(p1);
+                q = q.add(8);
+            }
+            while q != src.add(n) {
+                let fp = *q;
+                let w = wp.get_unchecked_mut((fp >> shift) as usize);
+                *(*w as *mut u64) = fp;
+                *w += size_of::<u64>();
+                q = q.add(1);
+            }
+            let mut over = false;
+            for b in 0..nb {
+                over |= *wp.get_unchecked(b) > *lim.get_unchecked(b);
+            }
+            if over {
+                spread = false;
+                break;
+            }
+        }
+        if !spread {
+            dedup_wide(sh, p1, item, total, &mut table, &mut buckets);
+            continue;
+        }
+        for b in 0..nb {
+            let arr = base.add(b * stride);
+            let len = (*wp.get_unchecked(b) - arr as usize) / size_of::<u64>();
+            if len != 0 {
+                sub.dedup(p1, &rows, arr, len);
             }
         }
     }
