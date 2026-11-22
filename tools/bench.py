@@ -12,7 +12,7 @@ rows = []
 for _ in range(runs):
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     t = time.perf_counter()
-    p = subprocess.run([binary, data, "/home/user/out/bench"], env=env, capture_output=True, text=True)
+    p = subprocess.run([binary, data, os.environ.get("XOUT", "/home/user/out") + "/bench"], env=env, capture_output=True, text=True)
     wall = (time.perf_counter() - t) * 1e3
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
     m = re.search(r"setup ([\d.]+) ms \| phase1 ([\d.]+) \| phase2 ([\d.]+) \| phase3 ([\d.]+) \| finish ([\d.]+) \| total ([\d.]+)", p.stderr)
