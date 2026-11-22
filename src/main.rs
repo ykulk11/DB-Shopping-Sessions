@@ -1332,26 +1332,60 @@ unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &At
         let first = c << ROW_BITS;
         let pur = &src.pur;
         let mut pcur = pur.partition_point(|x| x.0 < first);
-        for i in 0..used {
-            if i + 16 < used {
+        // `pur` holds strictly increasing row numbers, so the rows run in
+        // stretches without a purchase, each closed by one purchase row.
+        // Rows below `pf_end` have a row 16 ahead whose person to prefetch.
+        let pf_end = used.saturating_sub(16);
+        let mut i = 0usize;
+        loop {
+            let stop = if pcur < pur.len() {
+                ((pur.get_unchecked(pcur).0 - first) as usize).min(used)
+            } else {
+                used
+            };
+            let mid = stop.min(pf_end).max(i);
+            while i < mid {
+                sh.intern.prefetch_person((*base.add(i + 16)).uidx);
+                if i % 4 == 0 {
+                    // One page ahead in the row store.
+                    prefetch(base.add(i + 256) as *const u8);
+                }
+                let r = *base.add(i);
+                if r.tsv & VALID != 0 {
+                    let person = sh.intern.person(r.uidx);
+                    out.ev.push(&mut out.arena, (person >> PSHIFT) as usize, PEv { person, ts: r.tsv & !VALID });
+                }
+                i += 1;
+            }
+            while i < stop {
+                // The last 16 rows: nothing ahead to prefetch.
+                let r = *base.add(i);
+                if r.tsv & VALID != 0 {
+                    let person = sh.intern.person(r.uidx);
+                    out.ev.push(&mut out.arena, (person >> PSHIFT) as usize, PEv { person, ts: r.tsv & !VALID });
+                }
+                i += 1;
+            }
+            if i >= used {
+                break;
+            }
+            // Row i is a purchase.
+            if i < pf_end {
                 sh.intern.prefetch_person((*base.add(i + 16)).uidx);
             }
             if i % 4 == 0 {
-                // One page ahead in the row store.
                 prefetch(base.add(i + 256) as *const u8);
             }
             let r = *base.add(i);
-            let is_pur = pcur < pur.len() && pur.get_unchecked(pcur).0 == first + i as u32;
             if r.tsv & VALID != 0 {
                 let person = sh.intern.person(r.uidx);
                 let part = (person >> PSHIFT) as usize;
                 let ts = r.tsv & !VALID;
                 out.ev.push(&mut out.arena, part, PEv { person, ts });
-                if is_pur {
-                    out.pu.push(&mut out.arena, part, PPu { person, ts, pc: pur.get_unchecked(pcur).1, pad: 0 });
-                }
+                out.pu.push(&mut out.arena, part, PPu { person, ts, pc: pur.get_unchecked(pcur).1, pad: 0 });
             }
-            pcur += is_pur as usize;
+            pcur += 1;
+            i += 1;
         }
     }
     out.ev.finish(&mut out.arena);
@@ -1430,6 +1464,9 @@ unsafe fn phase3(
     let mut active: Vec<u32> = Vec::with_capacity(ncamp + 1);
     let mut catsum = vec![0u64; ncat];
     let mut radix_tmp: Vec<u32> = Vec::new();
+    // Bit g set when event g of the partition comes more than GAP_MS after
+    // event g - 1 (meaningful within a person only), plus a bit at the end.
+    let mut brk: Vec<u64> = Vec::new();
     let mut out = UserCols {
         rows: 0,
         uid: Vec::new(),
@@ -1469,7 +1506,9 @@ unsafe fn phase3(
         }
         pos.copy_from_slice(&cnt);
         tsbuf.clear();
-        tsbuf.reserve(n_ev);
+        // 64 zeros after the end for the break scan below.
+        tsbuf.reserve(n_ev + 64);
+        std::ptr::write_bytes(tsbuf.as_mut_ptr().add(n_ev), 0, 64);
         tsbuf.set_len(n_ev);
         for t in p2 {
             t.ev.for_each(q, |r| {
@@ -1546,6 +1585,35 @@ unsafe fn phase3(
         }
         let t_c = Instant::now();
 
+        // Session breaks for the whole partition, eight events at a time.
+        let nw = (n_ev >> 6) + 1;
+        brk.clear();
+        brk.reserve(nw);
+        {
+            use std::arch::x86_64::*;
+            let tp = tsbuf.as_ptr();
+            let gap = _mm256_set1_epi32(GAP_MS as i32);
+            let bp = brk.as_mut_ptr();
+            for w in 0..nw {
+                let mut word = 0u64;
+                for q in 0..8 {
+                    let at = (w << 6) + (q << 3);
+                    let cur = _mm256_loadu_si256(tp.add(at) as *const __m256i);
+                    let before = if at == 0 {
+                        _mm256_permutevar8x32_epi32(cur, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6))
+                    } else {
+                        _mm256_loadu_si256(tp.add(at - 1) as *const __m256i)
+                    };
+                    // Within a person the difference is below 2^31.
+                    let big = _mm256_cmpgt_epi32(_mm256_sub_epi32(cur, before), gap);
+                    word |= (_mm256_movemask_ps(_mm256_castsi256_ps(big)) as u32 as u64) << (q << 3);
+                }
+                *bp.add(w) = word;
+            }
+            brk.set_len(nw);
+            *brk.get_unchecked_mut(n_ev >> 6) |= 1u64 << (n_ev & 63);
+        }
+
         let mut pcur = 0usize;
         for i in 0..l {
             let a = cnt[i] as usize;
@@ -1553,7 +1621,6 @@ unsafe fn phase3(
             if a == b {
                 continue;
             }
-            let evs = &tsbuf[a..b];
             let cls: &[ClS] = if n_cl > 0 { &cbuf[ccnt[i] as usize..ccnt[i + 1] as usize] } else { &[] };
             let name = id_bytes(names[i]);
             let pkey = (i as u64) << 32;
@@ -1566,17 +1633,20 @@ unsafe fn phase3(
             let mut lo = 0usize;
             let mut hi = 0usize;
 
-            let mut k = 0usize;
-            let nev = evs.len();
-            while k < nev {
-                // One session: events k..j.
-                let start = evs[k];
-                let mut prev = start;
-                let mut j = k + 1;
-                while j < nev && evs[j] - prev <= GAP_MS {
-                    prev = evs[j];
-                    j += 1;
+            let mut k = a;
+            while k < b {
+                // One session: events k..j, j the first break after k (or b).
+                let start = *tsbuf.get_unchecked(k);
+                let s1 = k + 1;
+                let mut w = s1 >> 6;
+                let mut bits = *brk.get_unchecked(w) & (!0u64 << (s1 & 63));
+                while bits == 0 {
+                    // Ends at the latest on the bit at n_ev >= b.
+                    w += 1;
+                    bits = *brk.get_unchecked(w);
                 }
+                let j = ((w << 6) + bits.trailing_zeros() as usize).min(b);
+                let prev = *tsbuf.get_unchecked(j - 1);
                 let n_events = (j - k) as u32;
                 k = j;
 
@@ -1694,11 +1764,71 @@ unsafe fn phase3(
 /// shared devices), the standard sort for the rest.
 #[inline(always)]
 fn sort_times(v: &mut [u32], tmp: &mut Vec<u32>) {
+    if v.len() <= 16 {
+        // SAFETY: 2..=16 values, each below 2^31 (VALID is cleared).
+        unsafe { rank_sort16(v) };
+        return;
+    }
     if v.len() < 2048 {
         v.sort_unstable();
         return;
     }
     radix_sort(v, tmp);
+}
+
+/// -1 in the upper half: `TIE[15 - j + i]` is -1 exactly when lane i > j.
+static TIE: [i32; 32] = {
+    let mut t = [0i32; 32];
+    let mut k = 16;
+    while k < 32 {
+        t[k] = -1;
+        k += 1;
+    }
+    t
+};
+
+/// Branchless sort of 2..=16 values below 2^31: every value's final place is
+/// the number of values smaller than it, plus the equal ones before it.
+#[inline(always)]
+unsafe fn rank_sort16(v: &mut [u32]) {
+    use std::arch::x86_64::*;
+    let n = v.len();
+    let p = v.as_mut_ptr();
+    let idx0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let nn = _mm256_set1_epi32(n as i32);
+    let a = _mm256_maskload_epi32(p as *const i32, _mm256_cmpgt_epi32(nn, idx0));
+    let tie = TIE.as_ptr();
+    let mut buf = [0u32; 16];
+    let mut rk = [0u32; 16];
+    let mut ra = _mm256_setzero_si256();
+    if n <= 8 {
+        for j in 0..n {
+            // Lane i counts j when v[i] > v[j], or v[i] == v[j] and i > j.
+            let c = _mm256_set1_epi32(*p.add(j) as i32);
+            let t = _mm256_add_epi32(c, _mm256_loadu_si256(tie.add(15 - j) as *const __m256i));
+            ra = _mm256_sub_epi32(ra, _mm256_cmpgt_epi32(a, t));
+        }
+        _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, a);
+        _mm256_storeu_si256(rk.as_mut_ptr() as *mut __m256i, ra);
+    } else {
+        let idx1 = _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15);
+        let b = _mm256_maskload_epi32(p.add(8) as *const i32, _mm256_cmpgt_epi32(nn, idx1));
+        let mut rb = _mm256_setzero_si256();
+        for j in 0..n {
+            let c = _mm256_set1_epi32(*p.add(j) as i32);
+            let ta = _mm256_add_epi32(c, _mm256_loadu_si256(tie.add(15 - j) as *const __m256i));
+            let tb = _mm256_add_epi32(c, _mm256_loadu_si256(tie.add(23 - j) as *const __m256i));
+            ra = _mm256_sub_epi32(ra, _mm256_cmpgt_epi32(a, ta));
+            rb = _mm256_sub_epi32(rb, _mm256_cmpgt_epi32(b, tb));
+        }
+        _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, a);
+        _mm256_storeu_si256(buf.as_mut_ptr().add(8) as *mut __m256i, b);
+        _mm256_storeu_si256(rk.as_mut_ptr() as *mut __m256i, ra);
+        _mm256_storeu_si256(rk.as_mut_ptr().add(8) as *mut __m256i, rb);
+    }
+    for i in 0..n {
+        *p.add(*rk.get_unchecked(i) as usize) = *buf.get_unchecked(i);
+    }
 }
 
 #[inline(never)]
@@ -2317,6 +2447,37 @@ mod tests {
             }
         }
         Some(out)
+    }
+
+    /// The branchless small sort must agree with the standard sort.
+    #[test]
+    fn rank_sort_matches_std() {
+        let mut seed = 0x0f0f_1234_5678_9abcu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..3_000_000u32 {
+            let n = 1 + (next() % 16) as usize;
+            // Narrow ranges give many ties; wide ones reach just below 2^31.
+            let range = match round % 4 {
+                0 => 4,
+                1 => 1000,
+                2 => 1u64 << 31,
+                _ => 1 + next() % (1u64 << 31),
+            };
+            let top = if round % 8 == 2 { (1u64 << 31) - range } else { 0 };
+            let mut v: Vec<u32> = (0..n).map(|_| (top + next() % range) as u32).collect();
+            // Canaries around the slice: the sort must not touch them.
+            let mut padded = vec![0xdead_beefu32; n + 34];
+            padded[17..17 + n].copy_from_slice(&v);
+            v.sort_unstable();
+            unsafe { rank_sort16(&mut padded[17..17 + n]) };
+            assert_eq!(&padded[17..17 + n], &v[..], "round {round}");
+            assert!(padded[..17].iter().chain(&padded[17 + n..]).all(|&x| x == 0xdead_beef), "round {round}");
+        }
     }
 
     /// The direct product table must answer exactly like the hash table, for
