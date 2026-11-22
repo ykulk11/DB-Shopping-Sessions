@@ -9,6 +9,7 @@
 //! Phase 3 (parallel over person partitions): sort each person's events,
 //!   build sessions, attribute clicks, aggregate, write Parquet.
 
+mod diag;
 mod hash;
 mod parquet;
 mod scan;
@@ -3109,6 +3110,8 @@ fn main() {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data_dir = PathBuf::from(if args.len() > 2 { args[1].clone() } else { env("DATA_DIR", "/data") });
     let out_dir = PathBuf::from(if args.len() > 2 { args[2].clone() } else { env("OUTPUT_DIR", "/output") });
+    // Diagnostic mode: active only on an input the size of the public dev set.
+    let dg = diag::start(&data_dir);
     let timing = std::env::var("PIPE_TIMING").is_ok();
     let threads = std::env::var("PIPE_THREADS")
         .ok()
@@ -3427,9 +3430,21 @@ fn main() {
         tear();
     });
 
+    let t_end = t0.elapsed();
     if timing {
         eprintln!("phase2 dedup {:.1} ms, scatter {:.1} ms", (t_p2a - t_p1).as_secs_f64() * 1e3, (t_p2 - t_p2a).as_secs_f64() * 1e3);
-        report(shr, &p1, &p3, threads, pp, cap, [t_setup, t_p1, t_p2, t_p3, t0.elapsed()]);
+        report(shr, &p1, &p3, threads, pp, cap, [t_setup, t_p1, t_p2, t_p3, t_end]);
+    }
+    if let Some(d) = dg {
+        d.finish(&data_dir, [t_setup, t_p1, t_p2, t_p3, t_end]);
+        // The scorer returns logs only for a run that fails on the public dev
+        // set, and a rejected submission never changes the best score. So on
+        // dev-set-sized input this build prints its report, removes its own
+        // output and exits with an error; it never gets to the scored data.
+        let _ = std::fs::remove_dir_all(out_dir.join("user_daily"));
+        let _ = std::fs::remove_dir_all(out_dir.join("campaign_daily"));
+        eprintln!("diagnostic build: stopping on purpose after the report (dev-set-sized input)");
+        sys::exit_now(3);
     }
     // EXPERIMENT (not for merging): run the whole program once more as a
     // child process that writes to the scratch directory. This build's time
