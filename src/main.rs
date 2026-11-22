@@ -1485,6 +1485,7 @@ unsafe fn phase3(
     p1: &[P1],
     p2: &[P2],
     next: &AtomicUsize,
+    order: &[u32],
     pp: Params,
     tid: usize,
     out_dir: &Path,
@@ -1553,10 +1554,11 @@ unsafe fn phase3(
     let mut names = vec![0u64; l];
     let mut tm = [0.0f64; 4];
     loop {
-        let q = next.fetch_add(1, Ordering::Relaxed);
-        if q >= pp.np_used {
+        let k = next.fetch_add(1, Ordering::Relaxed);
+        if k >= pp.np_used {
             break;
         }
+        let q = order[k] as usize;
         let n_ev: usize = p2.iter().map(|t| t.ev.count(q)).sum();
         if n_ev == 0 {
             continue;
@@ -2821,12 +2823,23 @@ fn main() {
     let p2r = &p2;
     let out_ref = &out_dir;
     let nextr = &next;
+    // Largest partitions first (events plus clicks), so that no big one
+    // is left for the end while the other threads sit idle.
+    let mut order: Vec<(u32, u32)> = (0..pp.np_used)
+        .map(|q| {
+            let w: usize = p2.iter().map(|t| t.ev.count(q)).sum::<usize>() + p1.iter().map(|t| t.cl.count(q)).sum::<usize>();
+            (w.min(u32::MAX as usize) as u32, q as u32)
+        })
+        .collect();
+    order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let order: Vec<u32> = order.into_iter().map(|x| x.1).collect();
+    let orderr = &order[..];
     let p3: Vec<P3> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..pp.threads)
             .map(|tid| {
                 s.spawn(move || {
                     shr.pin(tid);
-                    unsafe { phase3(shr, p1r, p2r, nextr, pp, tid, out_ref) }
+                    unsafe { phase3(shr, p1r, p2r, nextr, orderr, pp, tid, out_ref) }
                 })
             })
             .collect();
