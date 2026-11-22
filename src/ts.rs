@@ -78,13 +78,85 @@ pub unsafe fn datetime19(p: *const u8) -> i64 {
     days * 86_400 + sec
 }
 
+/// Remembers the dates seen recently, so `YYYY-MM-DD` is validated and
+/// converted once per distinct date instead of once per row. Indexed by the
+/// day-of-month digits: a window of a few weeks never has two dates sharing a slot.
+pub struct DateCache {
+    a: [u64; 64],
+    b: [u32; 64],
+    base: [i64; 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        DateCache { a: [0; 64], b: [0; 64], base: [0; 64] }
+    }
+}
+
+/// `YYYY-MM-DDT` (11 bytes) as seconds since the epoch at that day's midnight, or `BAD`.
+#[cold]
+#[inline(never)]
+unsafe fn date_slow(p: *const u8) -> i64 {
+    if *p.add(4) != b'-' || *p.add(7) != b'-' || *p.add(10) != b'T' {
+        return BAD;
+    }
+    let y = year4(p);
+    let mo = two(p.add(5));
+    let d = two(p.add(8));
+    if y == u32::MAX || mo < 1 || mo > 12 || d < 1 {
+        return BAD;
+    }
+    let leap = ((y & 3 == 0) && (y % 25 != 0 || y & 15 == 0)) as usize;
+    if d > DIM[leap][mo as usize] as u32 {
+        return BAD;
+    }
+    let days = (365 * y + (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400) as i64 - 719_528
+        + CUM[leap][mo as usize] as i64
+        + d as i64
+        - 1;
+    days * 86_400
+}
+
+/// Same result as `datetime19`, using the date cache and one 8-byte load for the time.
+#[inline(always)]
+pub unsafe fn datetime19c(p: *const u8, dc: &mut DateCache) -> i64 {
+    let a = (p as *const u64).read_unaligned();
+    let b = (p.add(7) as *const u32).read_unaligned();
+    let slot = (((b >> 8) & 3) << 4 | ((b >> 16) & 15)) as usize;
+    let base = if *dc.a.get_unchecked(slot) == a && *dc.b.get_unchecked(slot) == b {
+        *dc.base.get_unchecked(slot)
+    } else {
+        let base = date_slow(p);
+        if base == BAD {
+            return BAD;
+        }
+        *dc.a.get_unchecked_mut(slot) = a;
+        *dc.b.get_unchecked_mut(slot) = b;
+        *dc.base.get_unchecked_mut(slot) = base;
+        base
+    };
+    // "HH:MM:SS": digits become their values, the colons zero.
+    let x = (p.add(11) as *const u64).read_unaligned() ^ 0x3030_3a30_303a_3030;
+    if (x.wrapping_add(0x7676_7f76_767f_7676) | x) & 0x8080_8080_8080_8080 != 0 {
+        return BAD;
+    }
+    let y = x.wrapping_mul(10).wrapping_add(x >> 8);
+    let hh = y & 0xff;
+    let mm = (y >> 24) & 0xff;
+    let ss = (y >> 48) & 0xff;
+    if hh > 23 || mm > 59 || ss > 59 {
+        return BAD;
+    }
+    base + (hh * 3600 + mm * 60 + ss) as i64
+}
+
 /// Form F1 only, as seconds since the epoch, or `BAD`.
 #[inline(always)]
-pub unsafe fn parse_f1_seconds(p: *const u8, len: usize) -> i64 {
+pub unsafe fn parse_f1_seconds(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
     if len != 20 || *p.add(19) != b'Z' {
         return BAD;
     }
-    datetime19(p)
+    datetime19c(p, dc)
 }
 
 const ZEROS: u64 = 0x3030_3030_3030_3030;
@@ -106,10 +178,10 @@ fn swar8(x: u64) -> u64 {
 /// Any of the three forms, as milliseconds since the epoch, or `BAD`. A
 /// digits-only value too large to be inside any window is also `BAD`.
 #[inline(always)]
-pub unsafe fn parse_ts(p: *const u8, len: usize) -> i64 {
+pub unsafe fn parse_ts(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
     if len == 20 {
         if *p.add(19) == b'Z' {
-            let s = datetime19(p);
+            let s = datetime19c(p, dc);
             return if s == BAD { BAD } else { s * 1000 };
         }
     } else if len == 13 {
@@ -131,7 +203,7 @@ pub unsafe fn parse_ts(p: *const u8, len: usize) -> i64 {
             if hh > 23 || mm > 59 {
                 return BAD;
             }
-            let s = datetime19(p);
+            let s = datetime19c(p, dc);
             if s == BAD {
                 return BAD;
             }
@@ -238,6 +310,7 @@ mod tests {
         };
         let alphabet = b"0123456789-T:Z tz+./";
         let mut good = 0;
+        let mut dc = DateCache::new();
         for round in 0..3_000_000u32 {
             let mut s = format!(
                 "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
@@ -260,6 +333,8 @@ mod tests {
             let got = unsafe { datetime19(buf.as_ptr().add(32)) };
             let want = reference(&s);
             assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&s));
+            let cached = unsafe { datetime19c(buf.as_ptr().add(32), &mut dc) };
+            assert_eq!(cached, want, "cached {:?}", String::from_utf8_lossy(&s));
             if got != BAD {
                 good += 1;
             }
@@ -269,9 +344,10 @@ mod tests {
 
     #[test]
     fn timestamp_forms() {
-        let ts = |s: &str| {
+        let mut dc = DateCache::new();
+        let mut ts = |s: &str| {
             let buf = padded(s.as_bytes());
-            unsafe { parse_ts(buf.as_ptr().add(32), s.len()) }
+            unsafe { parse_ts(buf.as_ptr().add(32), s.len(), &mut dc) }
         };
         assert_eq!(ts("2026-10-03T23:58:10Z"), 1_791_071_890_000);
         assert_eq!(ts("2026-10-03T19:58:10-04:00"), 1_791_071_890_000);
@@ -309,6 +385,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
+        let mut dc = DateCache::new();
         for round in 0..2_000_000u32 {
             let v = next() % 10_000_000_000_000;
             let mut s = format!("{v:013}").into_bytes();
@@ -316,7 +393,7 @@ mod tests {
                 s[(next() % 13) as usize] = b"0123456789 .-+e/:"[(next() % 17) as usize];
             }
             let buf = padded(&s);
-            let got = unsafe { parse_ts(buf.as_ptr().add(32), 13) };
+            let got = unsafe { parse_ts(buf.as_ptr().add(32), 13, &mut dc) };
             let want = match std::str::from_utf8(&s).ok().filter(|t| t.bytes().all(|c| c.is_ascii_digit())) {
                 Some(t) => t.parse::<i64>().unwrap(),
                 None => BAD,

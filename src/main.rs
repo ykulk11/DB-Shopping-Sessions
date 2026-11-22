@@ -58,18 +58,20 @@ struct EvRec {
     pc: u32,
 }
 
-/// A valid click as parsed: the user is not yet resolved to a person.
+/// A valid click, stored in its person's partition.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Click {
-    /// Interned user ID in phase 1, person in phase 2.
-    who: u32,
     /// ts - (window_start - 7 days), in ms.
     ts: u32,
-    camp: u32,
-    idlen: u32,
-    idptr: u64,
+    /// Person's index within the partition in the high 12 bits, campaign below.
+    lc: u32,
+    /// The click_id bytes, as `idref` packs them.
+    idref: u64,
 }
+
+const CAMP_BITS: u32 = 20;
+const CAMP_MASK: u32 = (1 << CAMP_BITS) - 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -84,6 +86,7 @@ struct PPu {
     person: u32,
     ts: u32,
     pc: u32,
+    pad: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -95,82 +98,11 @@ struct Pend {
 }
 
 // ---------------------------------------------------------------------------
-// Partitioned append-only storage: chains of 4 KB blocks per partition.
+// Partitioned append-only storage. Each partition has one cache line of
+// buffer; a full line goes to the partition's current 4 KB block with
+// non-temporal stores, so the destination is never read before it is written.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-struct Head {
-    blk: *mut u8,
-    cur: *mut u8,
-    left: u32,
-    nblk: u32,
-}
-
-struct Scatter<T: Copy> {
-    heads: Vec<Head>,
-    _p: PhantomData<T>,
-}
-
-unsafe impl<T: Copy> Send for Scatter<T> {}
-unsafe impl<T: Copy> Sync for Scatter<T> {}
-
-impl<T: Copy> Scatter<T> {
-    const PER: usize = (4096 - 8) / size_of::<T>();
-
-    fn new(parts: usize) -> Self {
-        Scatter {
-            heads: vec![
-                Head { blk: std::ptr::null_mut(), cur: std::ptr::null_mut(), left: 0, nblk: 0 };
-                parts
-            ],
-            _p: PhantomData,
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn push(&mut self, arena: &mut Arena, part: usize, rec: T) {
-        let h = self.heads.get_unchecked_mut(part);
-        if h.left == 0 {
-            let b = arena.alloc(4096, 64);
-            *(b as *mut *mut u8) = h.blk;
-            h.blk = b;
-            h.cur = b.add(8);
-            h.left = Self::PER as u32;
-            h.nblk += 1;
-        }
-        std::ptr::write_unaligned(h.cur as *mut T, rec);
-        h.cur = h.cur.add(size_of::<T>());
-        h.left -= 1;
-    }
-
-    fn count(&self, part: usize) -> usize {
-        let h = &self.heads[part];
-        if h.nblk == 0 {
-            0
-        } else {
-            (h.nblk as usize - 1) * Self::PER + (Self::PER - h.left as usize)
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn for_each(&self, part: usize, mut f: impl FnMut(*mut T)) {
-        let h = *self.heads.get_unchecked(part);
-        let mut blk = h.blk;
-        let mut n = Self::PER - h.left as usize;
-        while !blk.is_null() {
-            let base = blk.add(8) as *mut T;
-            for i in 0..n {
-                f(base.add(i));
-            }
-            blk = *(blk as *const *mut u8);
-            n = Self::PER;
-        }
-    }
-}
-
-/// Scatter for event records with one cache line of buffer per partition:
-/// two records fill a line, which then goes to its 4 KB block with
-/// non-temporal stores, so the destination is never read first.
 #[derive(Clone, Copy)]
 struct WcHead {
     cur: *mut u8,
@@ -184,63 +116,69 @@ struct Blk {
     prev: u32,
 }
 
-struct WcScatter {
+/// `T` must be 8, 16 or 32 bytes.
+struct Wc<T: Copy> {
     wc: *mut u8,
     heads: Vec<WcHead>,
     blocks: Vec<Blk>,
+    _p: PhantomData<T>,
 }
 
-unsafe impl Send for WcScatter {}
-unsafe impl Sync for WcScatter {}
+unsafe impl<T: Copy> Send for Wc<T> {}
+unsafe impl<T: Copy> Sync for Wc<T> {}
 
-const WC_BLOCK_RECS: usize = 4096 / size_of::<EvRec>();
+impl<T: Copy> Wc<T> {
+    const SZ: usize = size_of::<T>();
+    const PER_LINE: u32 = (64 / size_of::<T>()) as u32;
+    const PER_BLOCK: usize = 4096 / size_of::<T>();
 
-impl WcScatter {
     unsafe fn new(parts: usize, arena: &mut Arena) -> Self {
-        WcScatter {
+        assert!(Self::SZ == 8 || Self::SZ == 16 || Self::SZ == 32);
+        Wc {
             wc: arena.alloc(parts * 64, 4096),
             heads: vec![WcHead { cur: std::ptr::null_mut(), cnt: 0, last: u32::MAX }; parts],
             blocks: Vec::with_capacity(4096),
+            _p: PhantomData,
         }
     }
 
     #[inline(always)]
-    unsafe fn push(&mut self, arena: &mut Arena, part: usize, rec: *const EvRec) {
+    unsafe fn push(&mut self, arena: &mut Arena, part: usize, rec: T) {
         use std::arch::x86_64::*;
         let h = self.heads.get_unchecked_mut(part);
         let c = h.cnt;
         let line = self.wc.add(part * 64);
-        let v = _mm256_loadu_si256(rec as *const __m256i);
+        let idx = c & (Self::PER_LINE - 1);
+        std::ptr::write(line.add(idx as usize * Self::SZ) as *mut T, rec);
         h.cnt = c + 1;
-        if c & 1 == 0 {
-            _mm256_store_si256(line as *mut __m256i, v);
-        } else {
-            if (c >> 1) & 63 == 0 {
+        if idx == Self::PER_LINE - 1 {
+            if (c / Self::PER_LINE) & 63 == 0 {
                 let b = arena.alloc(4096, 4096);
                 self.blocks.push(Blk { ptr: b, prev: h.last });
                 h.last = (self.blocks.len() - 1) as u32;
                 h.cur = b;
             }
             let a = _mm256_load_si256(line as *const __m256i);
+            let b = _mm256_load_si256(line.add(32) as *const __m256i);
             _mm256_stream_si256(h.cur as *mut __m256i, a);
-            _mm256_stream_si256(h.cur.add(32) as *mut __m256i, v);
+            _mm256_stream_si256(h.cur.add(32) as *mut __m256i, b);
             h.cur = h.cur.add(64);
         }
     }
 
-    /// Writes out the half-filled lines. Call once, after the last push.
+    /// Writes out the partly filled lines. Call once, after the last push.
     unsafe fn finish(&mut self, arena: &mut Arena) {
         for part in 0..self.heads.len() {
             let h = &mut self.heads[part];
-            if h.cnt & 1 == 1 {
-                let c = h.cnt - 1;
-                if (c >> 1) & 63 == 0 {
+            let rem = h.cnt & (Self::PER_LINE - 1);
+            if rem != 0 {
+                if (h.cnt / Self::PER_LINE) & 63 == 0 {
                     let b = arena.alloc(4096, 4096);
                     self.blocks.push(Blk { ptr: b, prev: h.last });
                     h.last = (self.blocks.len() - 1) as u32;
                     h.cur = b;
                 }
-                std::ptr::copy_nonoverlapping(self.wc.add(part * 64), h.cur, 32);
+                std::ptr::copy_nonoverlapping(self.wc.add(part * 64), h.cur, rem as usize * Self::SZ);
             }
         }
         std::arch::x86_64::_mm_sfence();
@@ -250,25 +188,32 @@ impl WcScatter {
         self.heads[part].cnt as usize
     }
 
+    /// Calls `f(first record, count)` for each block of a partition.
     #[inline(always)]
-    unsafe fn for_each(&self, part: usize, mut f: impl FnMut(*mut EvRec)) {
+    unsafe fn for_each_block(&self, part: usize, mut f: impl FnMut(*mut T, usize)) {
         let h = *self.heads.get_unchecked(part);
         let total = h.cnt as usize;
         if total == 0 {
             return;
         }
-        let nb = (total + WC_BLOCK_RECS - 1) / WC_BLOCK_RECS;
-        let mut n = total - (nb - 1) * WC_BLOCK_RECS;
+        let nb = (total + Self::PER_BLOCK - 1) / Self::PER_BLOCK;
+        let mut n = total - (nb - 1) * Self::PER_BLOCK;
         let mut bi = h.last;
         while bi != u32::MAX {
             let b = *self.blocks.get_unchecked(bi as usize);
-            let base = b.ptr as *mut EvRec;
+            f(b.ptr as *mut T, n);
+            bi = b.prev;
+            n = Self::PER_BLOCK;
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn for_each(&self, part: usize, mut f: impl FnMut(*mut T)) {
+        self.for_each_block(part, |base, n| {
             for i in 0..n {
                 f(base.add(i));
             }
-            bi = b.prev;
-            n = WC_BLOCK_RECS;
-        }
+        });
     }
 }
 
@@ -406,6 +351,12 @@ impl Intern {
             }
             i = (i + 1) & self.mask;
         }
+    }
+
+    #[inline(always)]
+    unsafe fn prefetch_person(&self, uidx: u32) {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch::<_MM_HINT_T0>(self.penc.wrapping_add(uidx as usize) as *const i8);
     }
 
     #[inline(always)]
@@ -569,14 +520,16 @@ unsafe fn event_type(p: *const u8, len: usize) -> u32 {
 
 struct P1 {
     sb: scan::ScanBuf,
+    dc: ts::DateCache,
     recs: Vec<EvRec>,
     pend: Vec<Pend>,
     crecs: Vec<Click>,
     il: InternLocal,
     arena: Arena,
-    ev: WcScatter,
+    ev: Wc<EvRec>,
     /// Valid clicks by person partition.
-    cl: Scatter<Click>,
+    cl: Wc<Click>,
+    cuid: Vec<u32>,
     links: Vec<(u32, u32)>,
     /// Seconds spent in: scan, parse, intern, scatter, linking, clicks, links.
     tm: [f64; 7],
@@ -650,8 +603,8 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         }
         let (h1, h2) = hash128(text.add(fs[0] as usize), l0);
         let l1 = (fe[1] - fs[1]) as usize;
-        let t = ts::parse_ts(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize);
-        let ing = ts::parse_f1_seconds(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize);
+        let t = ts::parse_ts(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize, &mut cx.dc);
+        let ing = ts::parse_f1_seconds(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
         let ty = event_type(text.add(fs[4] as usize), (fe[4] - fs[4]) as usize);
         let l5 = (fe[5] - fs[5]) as usize;
         let mut valid = (l1 != 0)
@@ -700,8 +653,8 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let t_d = Instant::now();
     let shift = 24 - sh.pe_bits;
     for i in 0..nrec {
-        let r = recs.add(i);
-        let part = (((*r).h1 >> 40) as usize) >> shift;
+        let r = *recs.add(i);
+        let part = ((r.h1 >> 40) as usize) >> shift;
         cx.ev.push(&mut cx.arena, part, r);
     }
     let t_e = Instant::now();
@@ -721,8 +674,12 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     if cx.pend.capacity() < lines {
         cx.pend = Vec::with_capacity(lines + lines / 2 + 16);
     }
+    if cx.cuid.capacity() < lines {
+        cx.cuid = Vec::with_capacity(lines + lines / 2 + 16);
+    }
     let recs = cx.crecs.as_mut_ptr();
     let pend = cx.pend.as_mut_ptr();
+    let cuid = cx.cuid.as_mut_ptr();
     let mut n = 0usize;
     let mut it = LineIter::new();
     let mut fs = [0u32; 4];
@@ -736,7 +693,7 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         if l0 == 0 || l1 == 0 {
             continue;
         }
-        let t = ts::parse_ts(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize);
+        let t = ts::parse_ts(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
         if t == BAD || t < sh.cs || t >= sh.we {
             continue;
         }
@@ -748,20 +705,20 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         let (lo, hi) = hash128(up, l1);
         sh.intern.prefetch(lo);
         *pend.add(n) = Pend { lo, hi, idref: idref(up, l1), rec: n as u32 };
-        *recs.add(n) = Click {
-            who: 0,
-            ts: (t - sh.cs) as u32,
-            camp,
-            idlen: l0 as u32,
-            idptr: text.add(fs[0] as usize) as u64,
-        };
+        *recs.add(n) = Click { ts: (t - sh.cs) as u32, lc: camp, idref: idref(text.add(fs[0] as usize), l0) };
         n += 1;
     }
     for i in 0..n {
         let p = *pend.add(i);
+        let u = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
+        sh.intern.prefetch_person(u);
+        *cuid.add(i) = u;
+    }
+    for i in 0..n {
         let mut r = *recs.add(i);
-        r.who = sh.intern.person(sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref));
-        cx.cl.push(&mut cx.arena, (r.who >> PSHIFT) as usize, r);
+        let person = sh.intern.person(*cuid.add(i));
+        r.lc |= (person & ((1 << PSHIFT) - 1)) << CAMP_BITS;
+        cx.cl.push(&mut cx.arena, (person >> PSHIFT) as usize, r);
     }
     cx.tm[5] += t_a.elapsed().as_secs_f64();
 }
@@ -854,16 +811,19 @@ unsafe fn link_people(sh: &Shared) {
 unsafe fn phase1(sh: &Shared) -> P1 {
     let pe = 1usize << sh.pe_bits;
     let mut arena = Arena::new();
-    let ev = WcScatter::new(pe, &mut arena);
+    let ev = Wc::new(pe, &mut arena);
+    let cl = Wc::new(sh.np, &mut arena);
     let mut cx = P1 {
         sb: scan::ScanBuf::new(),
+        dc: ts::DateCache::new(),
         recs: Vec::new(),
         pend: Vec::new(),
         crecs: Vec::new(),
         il: InternLocal { next: 0, end: 0 },
         arena,
         ev,
-        cl: Scatter::new(sh.np),
+        cl,
+        cuid: Vec::new(),
         links: Vec::new(),
         tm: [0.0; 7],
     };
@@ -916,6 +876,7 @@ unsafe fn phase1(sh: &Shared) -> P1 {
         }
     }
     cx.ev.finish(&mut cx.arena);
+    cx.cl.finish(&mut cx.arena);
     cx
 }
 
@@ -932,15 +893,18 @@ struct Params {
 
 struct P2 {
     arena: Arena,
-    ev: Scatter<PEv>,
-    pu: Scatter<PPu>,
+    ev: Wc<PEv>,
+    pu: Wc<PPu>,
 }
 
 unsafe impl Send for P2 {}
 unsafe impl Sync for P2 {}
 
 unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize) -> P2 {
-    let mut out = P2 { arena: Arena::new(), ev: Scatter::new(sh.np), pu: Scatter::new(sh.np) };
+    let mut arena = Arena::new();
+    let ev = Wc::new(sh.np, &mut arena);
+    let pu = Wc::new(sh.np, &mut arena);
+    let mut out = P2 { arena, ev, pu };
     let pe = 1usize << sh.pe_bits;
     let mut table: Vec<u64> = Vec::new();
     const TAG: u64 = 0xffff_0000_0000_0000;
@@ -992,21 +956,29 @@ unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize) -> P2 {
             });
         }
         for t in p1 {
-            t.ev.for_each(item, |r| {
-                let tsv = (*r).tsv;
-                if tsv & VALID != 0 {
-                    let person = sh.intern.person((*r).uidx);
-                    let part = (person >> PSHIFT) as usize;
-                    let ts = tsv & !VALID;
-                    out.ev.push(&mut out.arena, part, PEv { person, ts });
-                    let pc = (*r).pc;
-                    if pc != 0 {
-                        out.pu.push(&mut out.arena, part, PPu { person, ts, pc });
+            t.ev.for_each_block(item, |base, n| {
+                for i in 0..n {
+                    if i + 12 < n {
+                        sh.intern.prefetch_person((*base.add(i + 12)).uidx);
+                    }
+                    let r = base.add(i);
+                    let tsv = (*r).tsv;
+                    if tsv & VALID != 0 {
+                        let person = sh.intern.person((*r).uidx);
+                        let part = (person >> PSHIFT) as usize;
+                        let ts = tsv & !VALID;
+                        out.ev.push(&mut out.arena, part, PEv { person, ts });
+                        let pc = (*r).pc;
+                        if pc != 0 {
+                            out.pu.push(&mut out.arena, part, PPu { person, ts, pc, pad: 0 });
+                        }
                     }
                 }
             });
         }
     }
+    out.ev.finish(&mut out.arena);
+    out.pu.finish(&mut out.arena);
     out
 }
 
@@ -1018,8 +990,7 @@ unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize) -> P2 {
 struct ClS {
     ts: u32,
     camp: u32,
-    idptr: u64,
-    idlen: u32,
+    idref: u64,
 }
 
 struct UserCols {
@@ -1043,11 +1014,13 @@ struct Agg {
 struct P3 {
     rows: usize,
     agg: Agg,
+    /// Seconds spent in: grouping, sorting, sessions, writing.
+    tm: [f64; 4],
 }
 
 #[inline(always)]
 unsafe fn click_id<'a>(c: &ClS) -> &'a [u8] {
-    std::slice::from_raw_parts(c.idptr as *const u8, c.idlen as usize)
+    id_bytes(c.idref)
 }
 
 unsafe fn phase3(
@@ -1081,6 +1054,7 @@ unsafe fn phase3(
     let mut wpos = vec![0u32; ncamp + 1];
     let mut active: Vec<u32> = Vec::with_capacity(ncamp + 1);
     let mut catsum = vec![0u64; ncat];
+    let mut radix_tmp: Vec<u32> = Vec::new();
     let mut out = UserCols {
         rows: 0,
         uid: Vec::new(),
@@ -1092,6 +1066,8 @@ unsafe fn phase3(
         cat_valid: Vec::new(),
     };
     let week = WEEK_MS as u64;
+    let mut names = vec![0u64; l];
+    let mut tm = [0.0f64; 4];
     loop {
         let q = next.fetch_add(1, Ordering::Relaxed);
         if q >= pp.np_used {
@@ -1102,6 +1078,7 @@ unsafe fn phase3(
             continue;
         }
         let base = (q << PSHIFT) as u32;
+        let t_a = Instant::now();
 
         // Group event times by person with a counting sort.
         cnt.fill(0);
@@ -1143,7 +1120,7 @@ unsafe fn phase3(
             ccnt.fill(0);
             for t in p1 {
                 t.cl.for_each(q, |r| {
-                    *ccnt.get_unchecked_mut(((*r).who - base) as usize + 1) += 1;
+                    *ccnt.get_unchecked_mut(((*r).lc >> CAMP_BITS) as usize + 1) += 1;
                 });
             }
             let mut acc = 0u32;
@@ -1157,16 +1134,17 @@ unsafe fn phase3(
             cbuf.set_len(n_cl);
             for t in p1 {
                 t.cl.for_each(q, |r| {
-                    let li = ((*r).who - base) as usize;
+                    let li = ((*r).lc >> CAMP_BITS) as usize;
                     let at = *cpos.get_unchecked(li);
                     *cbuf.get_unchecked_mut(at as usize) =
-                        ClS { ts: (*r).ts, camp: (*r).camp, idptr: (*r).idptr, idlen: (*r).idlen };
+                        ClS { ts: (*r).ts, camp: (*r).lc & CAMP_MASK, idref: (*r).idref };
                     *cpos.get_unchecked_mut(li) = at + 1;
                 });
             }
         }
 
-        let mut pcur = 0usize;
+        let t_b = Instant::now();
+        // Sort every person's events and clicks by time, and find their names.
         for i in 0..l {
             let a = cnt[i] as usize;
             let b = cnt[i + 1] as usize;
@@ -1175,20 +1153,34 @@ unsafe fn phase3(
             }
             let evs = &mut tsbuf[a..b];
             if evs.len() > 1 {
-                evs.sort_unstable();
+                sort_times(evs, &mut radix_tmp);
             }
-            let cls: &mut [ClS] = if n_cl > 0 {
-                &mut cbuf[ccnt[i] as usize..ccnt[i + 1] as usize]
-            } else {
-                &mut []
-            };
-            if cls.len() > 1 {
-                cls.sort_unstable_by_key(|c| c.ts);
+            if n_cl > 0 {
+                let cls = &mut cbuf[ccnt[i] as usize..ccnt[i + 1] as usize];
+                if cls.len() > 1 {
+                    cls.sort_unstable_by_key(|c| c.ts);
+                }
             }
-
             let root = base + i as u32;
             let ne = *sh.intern.name_enc.add(root as usize);
-            let name = id_bytes(*sh.intern.id_ref.add(if ne == 0 { root } else { ne - 1 } as usize));
+            let r = *sh.intern.id_ref.add(if ne == 0 { root } else { ne - 1 } as usize);
+            names[i] = r;
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                (r & 0x0000_ffff_ffff_ffff) as *const i8,
+            );
+        }
+        let t_c = Instant::now();
+
+        let mut pcur = 0usize;
+        for i in 0..l {
+            let a = cnt[i] as usize;
+            let b = cnt[i + 1] as usize;
+            if a == b {
+                continue;
+            }
+            let evs = &tsbuf[a..b];
+            let cls: &[ClS] = if n_cl > 0 { &cbuf[ccnt[i] as usize..ccnt[i + 1] as usize] } else { &[] };
+            let name = id_bytes(names[i]);
             let pkey = (i as u64) << 32;
 
             let mut cur_day = usize::MAX;
@@ -1305,13 +1297,72 @@ unsafe fn phase3(
             }
             active.clear();
         }
+        let t_d = Instant::now();
+        tm[0] += (t_b - t_a).as_secs_f64();
+        tm[1] += (t_c - t_b).as_secs_f64();
+        tm[2] += (t_d - t_c).as_secs_f64();
     }
 
+    let t_w = Instant::now();
     if out.rows > 0 {
         let path = out_dir.join("user_daily").join(format!("part-{tid:03}.parquet"));
         write_user_daily(&path, &out);
     }
-    P3 { rows: out.rows, agg }
+    tm[3] = t_w.elapsed().as_secs_f64();
+    P3 { rows: out.rows, agg, tm }
+}
+
+/// Sorts event times: a three-pass radix sort for large groups (whales and
+/// shared devices), the standard sort for the rest.
+#[inline(always)]
+fn sort_times(v: &mut [u32], tmp: &mut Vec<u32>) {
+    if v.len() < 2048 {
+        v.sort_unstable();
+        return;
+    }
+    radix_sort(v, tmp);
+}
+
+#[inline(never)]
+fn radix_sort(v: &mut [u32], tmp: &mut Vec<u32>) {
+    let n = v.len();
+    tmp.clear();
+    tmp.resize(n, 0);
+    let mut c0 = [0u32; 2048];
+    let mut c1 = [0u32; 2048];
+    let mut c2 = [0u32; 1024];
+    for &x in v.iter() {
+        c0[(x & 2047) as usize] += 1;
+        c1[((x >> 11) & 2047) as usize] += 1;
+        c2[(x >> 22) as usize] += 1;
+    }
+    let mut prefix = |c: &mut [u32]| {
+        let mut acc = 0u32;
+        for e in c.iter_mut() {
+            let t = *e;
+            *e = acc;
+            acc += t;
+        }
+    };
+    prefix(&mut c0);
+    prefix(&mut c1);
+    prefix(&mut c2);
+    for &x in v.iter() {
+        let b = (x & 2047) as usize;
+        tmp[c0[b] as usize] = x;
+        c0[b] += 1;
+    }
+    for &x in tmp.iter() {
+        let b = ((x >> 11) & 2047) as usize;
+        v[c1[b] as usize] = x;
+        c1[b] += 1;
+    }
+    for &x in v.iter() {
+        let b = (x >> 22) as usize;
+        tmp[c2[b] as usize] = x;
+        c2[b] += 1;
+    }
+    v.copy_from_slice(tmp);
 }
 
 #[inline(always)]
@@ -1449,7 +1500,7 @@ fn manifest_time(text: &[u8], key: &[u8]) -> i64 {
     let mut padded = rest[start..end.min(rest.len())].to_vec();
     let len = padded.len();
     padded.extend_from_slice(&[0u8; 32]);
-    let t = unsafe { ts::parse_ts(padded.as_ptr(), len) };
+    let t = unsafe { ts::parse_ts(padded.as_ptr(), len, &mut ts::DateCache::new()) };
     if t == BAD {
         sys::die("manifest.json: bad window timestamp");
     }
@@ -1535,11 +1586,14 @@ fn main() {
         }
     }
     let n_link_chunks = chunks.iter().filter(|c| c.kind == KIND_LINKS).count();
+    if camp_names.len() > CAMP_MASK as usize {
+        sys::die("more campaigns than this build supports");
+    }
 
     // Event partitions: about 16k rows each.
     let est_rows = bytes[KIND_EVENTS as usize] / 80;
     let mut pe_bits = 0u32;
-    while pe_bits < 13 && (est_rows >> pe_bits) > 16_384 {
+    while pe_bits < 11 && (est_rows >> pe_bits) > 16_384 {
         pe_bits += 1;
     }
 
@@ -1717,6 +1771,16 @@ fn main() {
         eprintln!(
             "phase1 cpu ms: scan {:.0} parse {:.0} intern {:.0} scatter {:.0} link {:.0} clicks {:.0} links {:.0}",
             tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, tm[6] * 1e3
+        );
+        let mut t3 = [0.0f64; 4];
+        for t in &p3 {
+            for i in 0..4 {
+                t3[i] += t.tm[i];
+            }
+        }
+        eprintln!(
+            "phase3 cpu ms: group {:.0} sort {:.0} sessions {:.0} write {:.0}",
+            t3[0] * 1e3, t3[1] * 1e3, t3[2] * 1e3, t3[3] * 1e3
         );
         let t_end = t0.elapsed();
         eprintln!(
