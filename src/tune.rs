@@ -7,7 +7,7 @@
 pub const PIN: bool = false;
 
 /// Kilobytes of text scanned and parsed at a time (PIPE_BLOCK_KB).
-pub const BLOCK_KB: usize = 32;
+pub const BLOCK_KB: usize = 8;
 
 /// Ask for transparent huge pages (PIPE_NO_HUGE=1 turns them off, PIPE_HUGE=1 on).
 pub const HUGE: bool = true;
