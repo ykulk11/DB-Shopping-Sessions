@@ -53,7 +53,7 @@ fi
 
 log "cpu: $(lscpu | sed -n 's/^Model name: *//p' | head -1) | $(nproc) cpus, $(lscpu | awk -F: '/Thread\(s\) per core/{gsub(/ /,"",$2); print $2}') threads per core"
 log "caches: L2 $(lscpu | sed -n 's/^L2 cache: *//p') | L3 $(lscpu | sed -n 's/^L3 cache: *//p')"
-log "kernel $(uname -r) | huge pages: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null) | memory $(free -g | awk '/^Mem/{print $2}') GB"
+log "kernel $(uname -r) | huge pages: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null) | defrag: $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null) | memory $(free -g | awk '/^Mem/{print $2}') GB"
 
 [ -d "$W/repo/.git" ] || git clone -q "$REPO" "$W/repo"
 cd "$W/repo" || exit 1
@@ -93,7 +93,7 @@ for ref, binary in bins:
             env = dict(os.environ, PIPE_TIMING="1")
             for kv in var.split():
                 k, v = kv.split("=", 1); env[k] = v
-            rows = []; nrows = "?"
+            rows = []; nrows = "?"; detail = {}
             for _ in range(runs):
                 out = os.path.join(W, "out", "o"); shutil.rmtree(out, ignore_errors=True)
                 b = resource.getrusage(resource.RUSAGE_CHILDREN); t = time.perf_counter()
@@ -106,10 +106,14 @@ for ref, binary in bins:
                 if r: nrows = r.group(1)
                 s = [float(x) for x in m.groups()]
                 rows.append([wall, s[5], s[0], s[1], s[2], s[3], s[4], (a.ru_utime - b.ru_utime) * 1e3, (a.ru_stime - b.ru_stime) * 1e3])
+                detail[wall] = [l for l in p.stderr.splitlines() if "cpu ms" in l or "threads=" in l or "dedup" in l]
             if not rows: continue
             best = min(rows, key=lambda x: x[0])
             print("%-18s %-4s %-22s %s  %s" % (ref[:18], d, (var or "default") + " min", " ".join("%7.0f" % x for x in best), nrows))
             print("%-18s %-4s %-22s %s" % ("", "", "median wall", "%7.0f" % statistics.median(x[0] for x in rows)))
+            if not var:
+                for l in detail.get(best[0], []):
+                    print("      " + l)
 EOF
 
 if [ "${PERF:-0}" = 1 ]; then
