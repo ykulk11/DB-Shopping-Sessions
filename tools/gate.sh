@@ -33,6 +33,11 @@ devcmp() {
 }
 fuzz() { python3 tools/fuzz/run.py "$1" "$2" --scale "$3" --keep-going --pipeline "$P" --work "$X/fuzz" | grep SUMMARY; }
 fuzzalt() { PIPE_SPLIT_ROWS=16 PIPE_BLOCK_KB=4 PIPE_PE_BITS=3 fuzz "$@"; }
+adv() {
+  ok=0
+  for s in "$@"; do tools/adv/run.sh "$s" 3000000 | tail -1 | grep -q " OK$" && ok=$((ok + 1)); done
+  if [ $ok = $# ]; then echo "adversarial sets: failures=0 of $#"; else echo "ADVERSARIAL $ok of $# passed"; fi
+}
 check "unit tests" units
 check "fixtures" fixtures
 check "dev answer" devcmp
@@ -52,10 +57,12 @@ if [ "$MODE" = full ]; then
   check "fuzz medium x60" fuzz "$F" $((F + 59)) medium
   check "fuzz small x500, alt settings" fuzzalt $((F + 2000)) $((F + 2499)) small
   check "fuzz medium x30, alt settings" fuzzalt $((F + 60)) $((F + 89)) medium
+  check "adversarial sets x6" adv $((F + 1)) $((F + 2)) $((F + 3)) $((F + 4)) $((F + 5)) $((F + 6))
 else
   check "fuzz small x300" fuzz "$F" $((F + 299)) small
   check "fuzz small x200, alt settings" fuzzalt $((F + 300)) $((F + 499)) small
   check "fuzz medium x10" fuzz "$F" $((F + 9)) medium
+  check "adversarial sets x1" adv $((F + 1))
 fi
 if [ $fail = 0 ]; then echo "GATE PASS ($MODE)"; else echo "GATE FAIL ($MODE)"; fi
 exit $fail
