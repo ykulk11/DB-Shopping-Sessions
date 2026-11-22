@@ -32,7 +32,7 @@ fuzzalt() { PIPE_SPLIT_ROWS=16 PIPE_BLOCK_KB=4 PIPE_PE_BITS=3 fuzz "$@"; }
 check "unit tests" units
 check "fixtures" python3 scripts/run_fixtures.py fixtures -- "$P"
 check "dev answer" devcmp
-check "dev, restart path" devcmp PIPE_CAP_BITS=14
+check "dev, restart path" devcmp PIPE_CAP_BITS=15
 check "dev, no huge pages, 8 threads" devcmp PIPE_NO_HUGE=1 PIPE_THREADS=8
 check "dev, 3 threads, touch" devcmp PIPE_TOUCH=1 PIPE_THREADS=3
 check "dev, 1 thread" devcmp PIPE_THREADS=1

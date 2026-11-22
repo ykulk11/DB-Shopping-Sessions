@@ -1857,7 +1857,9 @@ fn main() {
         .next_power_of_two()
         .max(1 << 18);
     if let Some(v) = std::env::var("PIPE_CAP_BITS").ok().and_then(|v| v.parse::<u32>().ok()) {
-        cap = 1usize << v;
+        // A test switch for the rebuild path. Below 2^15 slots the ID limit
+        // would not be a whole number of person partitions.
+        cap = 1usize << v.clamp(15, 34);
     }
 
     let t_setup = t0.elapsed();
