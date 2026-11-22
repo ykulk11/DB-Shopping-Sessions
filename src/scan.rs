@@ -57,18 +57,26 @@ unsafe fn mark_bad(sf: *mut u8, s: u64, mut badq: u64, pending: bool) -> bool {
     carry
 }
 
-/// Separator, newline and quote masks of the 64 bytes at `p`.
+/// Separator and quote masks of the 64 bytes at `p`, and the newline
+/// compare results, turned into a mask only when the word is recorded (this
+/// keeps one general register free while the next word is in flight).
 #[inline(always)]
-unsafe fn masks(p: *const u8, comma: __m256i, newline: __m256i, quote: __m256i) -> (u64, u64, u64) {
+unsafe fn masks(p: *const u8, comma: __m256i, newline: __m256i, quote: __m256i) -> (u64, (__m256i, __m256i), u64) {
     let v0 = _mm256_loadu_si256(p as *const __m256i);
     let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let cm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, comma)) as u32 as u64)
-        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, comma)) as u32 as u64) << 32);
-    let nm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, newline)) as u32 as u64)
-        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, newline)) as u32 as u64) << 32);
+    let n0 = _mm256_cmpeq_epi8(v0, newline);
+    let n1 = _mm256_cmpeq_epi8(v1, newline);
+    let s = (_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v0, comma), n0)) as u32 as u64)
+        | ((_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v1, comma), n1)) as u32 as u64) << 32);
     let qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, quote)) as u32 as u64)
         | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, quote)) as u32 as u64) << 32);
-    (cm | nm, nm, qm)
+    (s, (n0, n1), qm)
+}
+
+/// Newline mask from the compare results of `masks`.
+#[inline(always)]
+unsafe fn nmask(n: (__m256i, __m256i)) -> u64 {
+    (_mm256_movemask_epi8(n.0) as u32 as u64) | ((_mm256_movemask_epi8(n.1) as u32 as u64) << 32)
 }
 
 /// Writer state of `scan`.
@@ -181,12 +189,29 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
         // Whole words. The masks of the following word (which reach at most
         // 63 bytes past the block) tell what the byte after this one is.
         let whole = text.add(len & !63);
-        while p < whole {
+        // Two words per iteration: the loop overhead is shared and the
+        // masks alternate between two register sets instead of moving.
+        let pairs = text.add(len & !127);
+        while p < pairs {
+            _mm_prefetch::<_MM_HINT_T0>(p.add(PREFETCH_AHEAD) as *const i8);
+            let (s2, nm2, qm2) = masks(p.add(64), comma, newline, quote);
+            word(&mut o, s, nmask(nm), qm, s2, qm2, base);
+            base = _mm256_add_epi32(base, step);
+            _mm_prefetch::<_MM_HINT_T0>(p.add(PREFETCH_AHEAD + 64) as *const i8);
+            let (s3, nm3, qm3) = masks(p.add(128), comma, newline, quote);
+            word(&mut o, s2, nmask(nm2), qm2, s3, qm3, base);
+            base = _mm256_add_epi32(base, step);
+            s = s3;
+            nm = nm3;
+            qm = qm3;
+            p = p.add(128);
+        }
+        if p < whole {
             // Ask for the text a little ahead: across a page boundary the
             // hardware prefetcher starts over, and this covers the gap.
             _mm_prefetch::<_MM_HINT_T0>(p.add(PREFETCH_AHEAD) as *const i8);
             let (s2, nm2, qm2) = masks(p.add(64), comma, newline, quote);
-            word(&mut o, s, nm, qm, s2, qm2, base);
+            word(&mut o, s, nmask(nm), qm, s2, qm2, base);
             s = s2;
             nm = nm2;
             qm = qm2;
@@ -201,7 +226,7 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
             let nb = *p.add(64);
             let xs = ((nb == b',') | (nb == b'\n')) as u64;
             let xq = (nb == b'"') as u64;
-            word(&mut o, s & keep, nm & keep, qm & keep, xs, xq, base);
+            word(&mut o, s & keep, nmask(nm) & keep, qm & keep, xs, xq, base);
         }
     }
     let ns = o.dp.offset_from(seps) as usize;

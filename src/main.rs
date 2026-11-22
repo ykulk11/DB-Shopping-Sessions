@@ -775,6 +775,32 @@ unsafe fn chunk_range(f: &Mapped, k: usize) -> (usize, usize) {
     (begin, fin)
 }
 
+/// The purchase part of an event line (3% of lines), out of the hot loop so
+/// its registers do not crowd it. False when the price does not parse.
+#[cold]
+#[inline(never)]
+unsafe fn purchase(sh: &Shared, pur: &mut Vec<(u32, u32)>, text: *const u8, fs: &[u32; 8], fe: &[u32; 8], row: u32) -> bool {
+    let price = ts::parse_price(text.add(fs[6] as usize), (fe[6] - fs[6]) as usize);
+    if price == 0 {
+        return false;
+    }
+    let cat = sh.products.get(text.add(fs[5] as usize), (fe[5] - fs[5]) as usize, sh.unknown_cat);
+    pur.push((row, price | (cat << 24)));
+    true
+}
+
+/// Records an ingest_ts too far from the base for `Row::ing`; returns the key.
+#[cold]
+#[inline(never)]
+fn far_ing(far: &mut Vec<(u32, i64)>, row: u32, ing: i64, d: i64) -> u32 {
+    far.push((row, ing));
+    if d < 1 {
+        0
+    } else {
+        u32::MAX - 1
+    }
+}
+
 unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let t_a = Instant::now();
     scan::scan(text, len, &mut cx.sb);
@@ -819,7 +845,6 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         let t = ts::parse_ts(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize, &mut cx.dc);
         let ing = ts::parse_f1_seconds(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
         let ty = event_type(text.add(fs[4] as usize), (fe[4] - fs[4]) as usize);
-        let l5 = (fe[5] - fs[5]) as usize;
         // Fields 1 (user) and 5 (product) must not be empty.
         let mut valid = (empty & 0b10_0010 == 0)
             & ((t.wrapping_sub(wlo) as u64) < wspan)
@@ -827,13 +852,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             & (ing != BAD)
             & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY_MS);
         if valid && ty == 2 {
-            let price = ts::parse_price(text.add(fs[6] as usize), (fe[6] - fs[6]) as usize);
-            if price == 0 {
-                valid = false;
-            } else {
-                let cat = sh.products.get(text.add(fs[5] as usize), l5, sh.unknown_cat);
-                cx.pur.push((first + nrec as u32, price | (cat << 24)));
-            }
+            valid = purchase(sh, &mut cx.pur, text, &fs, &fe, first + nrec as u32);
         }
         // Seconds from the base. 0 and MAX - 1 stand for "further away than
         // fits" (never the case for a timestamp near the window); the exact
@@ -845,12 +864,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             if d >= 1 && d <= u32::MAX as i64 - 2 {
                 d as u32
             } else {
-                cx.far.push((first + nrec as u32, ing));
-                if d < 1 {
-                    0
-                } else {
-                    u32::MAX - 1
-                }
+                far_ing(&mut cx.far, first + nrec as u32, ing, d)
             }
         };
         let tsv = if valid { (t - ws) as u32 | VALID } else { 0 };

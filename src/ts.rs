@@ -120,6 +120,16 @@ unsafe fn date_slow(p: *const u8) -> i64 {
 /// Same result as `datetime19`, using the date cache and one 8-byte load for the time.
 #[inline(always)]
 pub unsafe fn datetime19c(p: *const u8, dc: &mut DateCache) -> i64 {
+    match datetime19o(p, dc) {
+        Some(s) => s,
+        None => BAD,
+    }
+}
+
+/// `datetime19c` as an `Option`, so callers that scale or offset the result
+/// branch straight to their own failure path instead of re-testing for `BAD`.
+#[inline(always)]
+unsafe fn datetime19o(p: *const u8, dc: &mut DateCache) -> Option<i64> {
     let a = (p as *const u64).read_unaligned();
     let b = (p.add(7) as *const u32).read_unaligned();
     // The day-of-month digits' low bits (tens: 2 bits, ones: 4 bits) as a 6-bit slot.
@@ -129,17 +139,14 @@ pub unsafe fn datetime19c(p: *const u8, dc: &mut DateCache) -> i64 {
     } else {
         let base = date_slow(p);
         if base == BAD {
-            return BAD;
+            return None;
         }
         *dc.a.get_unchecked_mut(slot) = a;
         *dc.b.get_unchecked_mut(slot) = b;
         *dc.base.get_unchecked_mut(slot) = base;
         base
     };
-    match time_of_day(p.add(11)) {
-        Some(sec) => base + sec,
-        None => BAD,
-    }
+    Some(base + time_of_day(p.add(11))?)
 }
 
 /// `HH:MM:SS` (8 bytes) as seconds since midnight, or `None` unless every
@@ -212,8 +219,10 @@ fn swar8(x: u64) -> u64 {
 pub unsafe fn parse_ts(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
     if len == 20 {
         if *p.add(19) == b'Z' {
-            let s = datetime19c(p, dc);
-            return if s == BAD { BAD } else { s * 1000 };
+            return match datetime19o(p, dc) {
+                Some(s) => s * 1000,
+                None => BAD,
+            };
         }
     } else if len == 13 {
         // The usual F3: thirteen digits.
@@ -225,16 +234,19 @@ pub unsafe fn parse_ts(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
         return BAD;
     } else if len == 25 {
         let sign = *p.add(19);
-        if sign == b'+' || sign == b'-' {
+        // '+' (0x2b) or '-' (0x2d) in one test.
+        if sign.wrapping_sub(b'+') & 0xfd == 0 {
             let off = match offset(p.add(20)) {
                 Some(off) => off,
                 None => return BAD,
             };
-            let s = datetime19c(p, dc);
-            if s == BAD {
-                return BAD;
-            }
-            return (if sign == b'+' { s - off } else { s + off }) * 1000;
+            let s = match datetime19o(p, dc) {
+                Some(s) => s,
+                None => return BAD,
+            };
+            // '+' subtracts the offset, '-' adds it; a mask instead of a branch on the sign.
+            let neg = ((sign == b'+') as i64).wrapping_neg();
+            return (s + ((off ^ neg) - neg)) * 1000;
         }
     }
     parse_digits(p, len, 17)
