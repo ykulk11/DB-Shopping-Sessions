@@ -10,7 +10,7 @@ pub const PIN: bool = false;
 pub const BLOCK_KB: usize = 32;
 
 /// Ask for transparent huge pages (PIPE_NO_HUGE=1 turns them off, PIPE_HUGE=1 on).
-pub const HUGE: bool = true;
+pub const HUGE: bool = false;
 
 /// Worker threads = usable CPUs divided by this (PIPE_THREADS sets the number).
 pub const THREAD_DIVISOR: usize = 1;
