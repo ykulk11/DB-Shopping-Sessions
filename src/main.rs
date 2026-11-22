@@ -823,7 +823,10 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         cx.pend = Vec::with_capacity(lines + lines / 2 + 16);
     }
     let (rows, first) = cx.rows.reserve(&mut cx.arena, lines);
-    let shift = 24 - sh.pe_bits;
+    // The partition is the top `pe_bits` bits of h1, i.e. (h1 >> 40) >> (24 -
+    // pe_bits), as one bit-field extract (start 64 - pe_bits, length pe_bits;
+    // 0 when pe_bits is 0, as before).
+    let pctl = (64 - sh.pe_bits as u64) | ((sh.pe_bits as u64) << 8);
     let rbase = (cx.ref_base | first) as u64;
     let pend = cx.pend.as_mut_ptr();
     // Running row pointer and row reference (rbase + rows so far).
@@ -844,7 +847,11 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let mut it = LineIter::new();
     let mut fs = [0u32; 8];
     let mut fe = [0u32; 8];
-    while it.line < lines {
+    // Counts down instead of comparing `it.line` with `lines`: no bound kept
+    // in a register, and the iterator's own line count is never read here.
+    let mut left = lines;
+    while left != 0 {
+        left -= 1;
         if !it.next::<7>(&cx.sb, &mut fs, &mut fe) {
             continue;
         }
@@ -893,7 +900,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         // Hash bits 8..40 as the tag, the row reference below.
         cx.fp.push(
             &mut cx.arena,
-            ((h1 >> 40) as usize) >> shift,
+            std::arch::x86_64::_bextr2_u64(h1, pctl) as usize,
             ((h1 << 24) & 0xffff_ffff_0000_0000) | rref,
         );
         if valid {

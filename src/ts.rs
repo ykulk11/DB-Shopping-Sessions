@@ -213,11 +213,19 @@ unsafe fn digits13(p: *const u8) -> Option<i64> {
     // 16-bit lanes: two digits each; 32-bit lanes: four digits each.
     let x = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010a));
     let x = _mm_madd_epi16(x, _mm_set1_epi32(0x0001_0064));
-    // Four 4-digit values (at most 9999) as 16-bit lanes, then two 8-digit values.
-    let x = _mm_packus_epi32(x, x);
+    Some(digits13_finish(x))
+}
+
+/// The end of `digits13`: four 32-bit lanes of 4-digit values (each at most
+/// 9999) to the 13-digit number. The low 16 bits of each lane are the whole
+/// value, so one byte shuffle packs them (no saturation is ever needed).
+#[inline(always)]
+unsafe fn digits13_finish(x: __m128i) -> i64 {
+    let x = _mm_shuffle_epi8(x, _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1));
+    // Two 8-digit values.
     let x = _mm_madd_epi16(x, _mm_set1_epi32(0x0001_2710));
     let v = _mm_cvtsi128_si64(x) as u64;
-    Some(((v & 0xffff_ffff) * 100_000_000 + (v >> 32)) as i64)
+    ((v & 0xffff_ffff) * 100_000_000 + (v >> 32)) as i64
 }
 
 /// Any of the three forms, as milliseconds since the epoch, or `BAD`. A
