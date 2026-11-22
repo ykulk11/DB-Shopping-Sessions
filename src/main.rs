@@ -591,8 +591,6 @@ unsafe fn event_type(p: *const u8, len: usize) -> u32 {
 struct P1 {
     sb: scan::ScanBuf,
     dc: ts::DateCache,
-    /// event_id hash (low half) of each row of the current block.
-    hs: Vec<u64>,
     pend: Vec<Pend>,
     crecs: Vec<Click>,
     il: InternLocal,
@@ -658,14 +656,12 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     scan::scan(text, len, &mut cx.sb);
     let t_b = Instant::now();
     let lines = cx.sb.lines;
-    if cx.hs.capacity() < lines {
-        cx.hs = Vec::with_capacity(lines + lines / 2 + 16);
-    }
     if cx.pend.capacity() < lines {
         cx.pend = Vec::with_capacity(lines + lines / 2 + 16);
     }
     let (rows, first) = cx.rows.reserve(&mut cx.arena, lines);
-    let hs = cx.hs.as_mut_ptr();
+    let shift = 24 - sh.pe_bits;
+    let rbase = (cx.ref_base | first) as u64;
     let pend = cx.pend.as_mut_ptr();
     let mut nrec = 0usize;
     let mut npend = 0usize;
@@ -715,7 +711,12 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         };
         let tsv = if valid { (t - ws) as u32 | VALID } else { 0 };
         *rows.add(nrec) = Row { uidx: u32::MAX, tsv, ing: ing_key, h2: h2 as u32 };
-        *hs.add(nrec) = h1;
+        // Hash bits 8..40 as the tag, the row reference below.
+        cx.fp.push(
+            &mut cx.arena,
+            ((h1 >> 40) as usize) >> shift,
+            ((h1 << 24) & 0xffff_ffff_0000_0000) | (rbase + nrec as u64),
+        );
         if valid {
             let up = text.add(fs[1] as usize);
             let (lo, hi) = hash128(up, l1);
@@ -732,14 +733,6 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         (*rows.add(p.rec as usize)).uidx = u;
     }
     let t_d = Instant::now();
-    let shift = 24 - sh.pe_bits;
-    let rbase = (cx.ref_base | first) as u64;
-    for i in 0..nrec {
-        let h1 = *hs.add(i);
-        let part = ((h1 >> 40) as usize) >> shift;
-        // Hash bits 8..40 as the tag, the row reference below.
-        cx.fp.push(&mut cx.arena, part, ((h1 << 24) & 0xffff_ffff_0000_0000) | (rbase + i as u64));
-    }
     cx.rows.commit(nrec);
     let t_e = Instant::now();
     cx.tm[0] += (t_b - t_a).as_secs_f64();
@@ -901,7 +894,6 @@ unsafe fn phase1(sh: &Shared, tid: usize, threads: usize) -> P1 {
     let mut cx = P1 {
         sb: scan::ScanBuf::new(),
         dc: ts::DateCache::new(),
-        hs: Vec::new(),
         pend: Vec::new(),
         crecs: Vec::new(),
         il: InternLocal { next: 0, end: 0 },
@@ -1134,11 +1126,19 @@ struct UserCols {
     cat_valid: Vec<u8>,
 }
 
+/// Totals for one campaign on one day.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Cell {
+    revenue: u64,
+    sessions: u32,
+    purchasing: u32,
+    assisted: u32,
+    pad: u32,
+}
+
 struct Agg {
-    sessions: Vec<u32>,
-    purchasing: Vec<u32>,
-    assisted: Vec<u32>,
-    revenue: Vec<u64>,
+    cells: Vec<Cell>,
 }
 
 struct P3 {
@@ -1174,12 +1174,7 @@ unsafe fn phase3(
     let ndays = sh.ndays;
     let ncat = sh.cat_names.len();
     let cells = (ncamp + 1) * ndays;
-    let mut agg = Agg {
-        sessions: vec![0; cells],
-        purchasing: vec![0; cells],
-        assisted: vec![0; cells],
-        revenue: vec![0; cells],
-    };
+    let mut agg = Agg { cells: vec![Cell::default(); cells] };
     let mut wcnt = vec![0u32; ncamp + 1];
     let mut wpos = vec![0u32; ncamp + 1];
     let mut active: Vec<u32> = Vec::with_capacity(ncamp + 1);
@@ -1409,15 +1404,16 @@ unsafe fn phase3(
                         }
                         cell = cls[best].camp as usize * ndays + d;
                         for &c in active.iter() {
-                            *agg.assisted.get_unchecked_mut(c as usize * ndays + d) += 1;
+                            agg.cells.get_unchecked_mut(c as usize * ndays + d).assisted += 1;
                         }
                     } else {
                         cell = ncamp * ndays + d;
                     }
                 }
-                *agg.sessions.get_unchecked_mut(cell) += 1;
-                *agg.purchasing.get_unchecked_mut(cell) += has as u32;
-                *agg.revenue.get_unchecked_mut(cell) += rev;
+                let cl = agg.cells.get_unchecked_mut(cell);
+                cl.sessions += 1;
+                cl.purchasing += has as u32;
+                cl.revenue += rev;
             }
             if d_sessions > 0 {
                 emit_row(sh, &mut out, name, cur_day, d_sessions, d_events, d_rev, d_has, &mut catsum);
@@ -1649,6 +1645,9 @@ fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .clamp(1, MAX_THREADS);
+    if std::env::var("PIPE_TOUCH").is_ok() {
+        sys::set_touch_only(true);
+    }
     if std::env::var("PIPE_POPULATE").is_ok() {
         sys::set_populate(true);
     }
@@ -1897,10 +1896,10 @@ fn finish_outputs(sh: &Shared, p3: &[P3], out_dir: &Path) {
     let mut revenue = vec![0u64; cells];
     for t in p3 {
         for i in 0..cells {
-            sessions[i] += t.agg.sessions[i] as u64;
-            purchasing[i] += t.agg.purchasing[i] as u64;
-            assisted[i] += t.agg.assisted[i] as u64;
-            revenue[i] += t.agg.revenue[i];
+            sessions[i] += t.agg.cells[i].sessions as u64;
+            purchasing[i] += t.agg.cells[i].purchasing as u64;
+            assisted[i] += t.agg.cells[i].assisted as u64;
+            revenue[i] += t.agg.cells[i].revenue;
         }
     }
     let mut c_id = Vec::new();

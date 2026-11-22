@@ -78,6 +78,13 @@ pub unsafe fn release(p: *mut u8, len: usize) {
     munmap(p as *mut c_void, len);
 }
 
+static mut TOUCH_ONLY: bool = false;
+
+/// For testing the path taken on kernels without MADV_POPULATE_WRITE.
+pub fn set_touch_only(on: bool) {
+    unsafe { TOUCH_ONLY = on }
+}
+
 /// Faults in `[p, p + len)` for writing, one page at a time in the kernel,
 /// so later reads and writes take no page fault. Safe while other threads
 /// use the memory.
@@ -86,7 +93,7 @@ pub unsafe fn populate_write(p: *mut u8, len: usize) {
     if len == 0 {
         return;
     }
-    if madvise(p as *mut c_void, len, MADV_POPULATE_WRITE) != 0 {
+    if TOUCH_ONLY || madvise(p as *mut c_void, len, MADV_POPULATE_WRITE) != 0 {
         // Older kernels: an atomic no-op write per page does the same.
         use std::sync::atomic::{AtomicU8, Ordering};
         let mut at = 0;
