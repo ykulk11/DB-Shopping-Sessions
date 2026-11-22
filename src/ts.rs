@@ -252,6 +252,89 @@ pub unsafe fn parse_ts(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
     parse_digits(p, len, 17)
 }
 
+/// The cached `YYYY-MM-DDT` part of `datetime19o`: seconds at that day's midnight.
+#[inline(always)]
+unsafe fn date_base(p: *const u8, dc: &mut DateCache) -> Option<i64> {
+    let a = (p as *const u64).read_unaligned();
+    let b = (p.add(7) as *const u32).read_unaligned();
+    let slot = _pext_u32(b, 0x000f_0300) as usize;
+    if *dc.a.get_unchecked(slot) == a && *dc.b.get_unchecked(slot) == b {
+        Some(*dc.base.get_unchecked(slot))
+    } else {
+        let base = date_slow(p);
+        if base == BAD {
+            return None;
+        }
+        *dc.a.get_unchecked_mut(slot) = a;
+        *dc.b.get_unchecked_mut(slot) = b;
+        *dc.base.get_unchecked_mut(slot) = base;
+        Some(base)
+    }
+}
+
+/// `date_base(q)` when `p`'s date was just looked up: the same 11 bytes give
+/// the same day without a second lookup (ingest_ts usually shares ts's date).
+#[inline(always)]
+unsafe fn date_base_after(q: *const u8, p: *const u8, pbase: i64, dc: &mut DateCache) -> Option<i64> {
+    let x = (q as *const u64).read_unaligned() ^ (p as *const u64).read_unaligned();
+    let y = (q.add(7) as *const u32).read_unaligned() ^ (p.add(7) as *const u32).read_unaligned();
+    if x | y as u64 == 0 {
+        return Some(pbase);
+    }
+    date_base(q, dc)
+}
+
+/// Two `HH:MM:SS` fields at once: the same result as `time_of_day` on each,
+/// but `None` unless both are valid. One 128-bit pass validates and converts.
+#[inline(always)]
+unsafe fn tod_pair(p: *const u8, q: *const u8) -> Option<(i64, i64)> {
+    let v = _mm_castpd_si128(_mm_loadh_pd(_mm_castsi128_pd(_mm_loadl_epi64(p as *const __m128i)), q as *const f64));
+    // Digits become their values, the colons zero; anything else exceeds the limit.
+    let t = _mm_xor_si128(v, _mm_set1_epi64x(0x3030_3a30_303a_3030));
+    let over = _mm_subs_epu8(t, _mm_set1_epi64x(0x0909_0009_0900_0909));
+    let dg = _mm_shuffle_epi8(t, _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, 8, 9, 11, 12, 14, 15, -1, -1));
+    // 16-bit lanes: hour, minute, second, 0 for each field.
+    let x = _mm_maddubs_epi16(dg, _mm_set1_epi16(0x010a));
+    let range = _mm_cmpgt_epi16(x, _mm_setr_epi16(23, 59, 59, 0, 23, 59, 59, 0));
+    let bad = _mm_or_si128(over, range);
+    if _mm_testz_si128(bad, bad) == 0 {
+        return None;
+    }
+    // 32-bit lanes: h * 3600 + m * 60, s, for each field; then add the pairs.
+    let s = _mm_madd_epi16(x, _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0));
+    let s = _mm_add_epi32(s, _mm_srli_epi64::<32>(s));
+    Some((_mm_cvtsi128_si32(s) as i64, _mm_extract_epi32::<2>(s) as i64))
+}
+
+/// `(parse_ts(tp, tl), parse_f1_seconds(ip, il))` for an event line, with both
+/// times of day handled in one pass when ts is a datetime form.
+#[inline(always)]
+pub unsafe fn parse_event_times(tp: *const u8, tl: usize, ip: *const u8, il: usize, dc: &mut DateCache) -> (i64, i64) {
+    let ing_shape = il == 20 && *ip.add(19) == b'Z';
+    if tl == 20 {
+        if ing_shape && *tp.add(19) == b'Z' {
+            if let Some((tt, ti)) = tod_pair(tp.add(11), ip.add(11)) {
+                if let Some(bt) = date_base(tp, dc) {
+                    if let Some(bi) = date_base_after(ip, tp, bt, dc) {
+                        return ((bt + tt) * 1000, bi + ti);
+                    }
+                }
+            }
+        }
+    } else if tl == 25 {
+        let sign = *tp.add(19);
+        if ing_shape && sign.wrapping_sub(b'+') & 0xfd == 0 {
+            if let (Some((tt, ti)), Some(off)) = (tod_pair(tp.add(11), ip.add(11)), offset(tp.add(20))) {
+                if let (Some(bt), Some(bi)) = (date_base(tp, dc), date_base(ip, dc)) {
+                    let neg = ((sign == b'+') as i64).wrapping_neg();
+                    return ((bt + tt + ((off ^ neg) - neg)) * 1000, bi + ti);
+                }
+            }
+        }
+    }
+    (parse_ts(tp, tl, dc), parse_f1_seconds(ip, il, dc))
+}
+
 /// Digits only (leading zeros allowed) with at most `max_digits` significant
 /// digits, as a number; `BAD` otherwise, including the empty string.
 #[inline(never)]
@@ -582,6 +665,103 @@ mod tests {
             };
             assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&s));
         }
+    }
+
+    /// `parse_event_times` against `parse_ts` and `parse_f1_seconds` on random pairs.
+    #[test]
+    fn event_times_match_separate() {
+        let mut seed = 0x0bad_5eed_1234_9876u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let gen = |next: &mut dyn FnMut() -> u64, date: Option<(u64, u64, u64)>, ing: bool| -> (Vec<u8>, (u64, u64, u64)) {
+            let (y, mo, d) = date.unwrap_or_else(|| {
+                (
+                    match next() % 8 { 0 => next() % 10000, 1 => 2100, 2 => 2000, _ => 2025 + next() % 4 },
+                    if next() % 8 == 0 { next() % 14 } else { 1 + next() % 12 },
+                    if next() % 8 == 0 { next() % 33 } else { 1 + next() % 31 },
+                )
+            });
+            let tod = |next: &mut dyn FnMut() -> u64| {
+                if next() % 6 == 0 {
+                    format!("{:02}:{:02}:{:02}", next() % 26, next() % 62, next() % 62)
+                } else {
+                    format!("{:02}:{:02}:{:02}", next() % 24, next() % 60, next() % 60)
+                }
+            };
+            let dt = format!("{:04}-{:02}-{:02}T{}", y, mo, d, tod(next));
+            let form = if ing { if next() % 10 == 0 { next() % 4 } else { 0 } } else { next() % 4 };
+            let s = match form {
+                0 => format!("{dt}Z"),
+                1 => format!("{:013}", next() % 10_000_000_000_000),
+                2 => format!(
+                    "{dt}{}{:02}:{:02}",
+                    if next() % 2 == 0 { '+' } else { '-' },
+                    if next() % 6 == 0 { next() % 26 } else { next() % 24 },
+                    if next() % 6 == 0 { next() % 62 } else { next() % 60 }
+                ),
+                _ => {
+                    let n = (next() % 30) as usize;
+                    (0..n).map(|_| b"0123456789-T:Z+"[(next() % 15) as usize] as char).collect()
+                }
+            };
+            (s.into_bytes(), (y, mo, d))
+        };
+        let alphabet = b"0123456789-T:Z+ tz./";
+        let mutate = |next: &mut dyn FnMut() -> u64, s: &mut Vec<u8>| {
+            if s.is_empty() {
+                return;
+            }
+            match next() % 8 {
+                0 => {
+                    let at = (next() % s.len() as u64) as usize;
+                    s[at] = alphabet[(next() % alphabet.len() as u64) as usize];
+                }
+                1 => {
+                    let at = (next() % s.len() as u64) as usize;
+                    s[at] = next() as u8;
+                }
+                2 if next() % 4 == 0 => {
+                    if next() % 2 == 0 {
+                        s.pop();
+                    } else {
+                        s.push(b"0Z+ "[(next() % 4) as usize]);
+                    }
+                }
+                _ => {}
+            }
+        };
+        let mut dc1 = DateCache::new();
+        let mut dc2 = DateCache::new();
+        let mut good = 0;
+        for _ in 0..4_000_000u32 {
+            let (mut a, date) = gen(&mut next, None, false);
+            let same = next() % 2 == 0;
+            let (mut b, _) = gen(&mut next, if same { Some(date) } else { None }, true);
+            mutate(&mut next, &mut a);
+            mutate(&mut next, &mut b);
+            let mut buf = vec![0u8; 32];
+            buf.extend_from_slice(&a);
+            for _ in 0..1 + next() % 4 {
+                buf.push(next() as u8);
+            }
+            let ib = buf.len();
+            buf.extend_from_slice(&b);
+            for _ in 0..64 {
+                buf.push(if next() % 2 == 0 { next() as u8 } else { b'0' + (next() % 10) as u8 });
+            }
+            let (tp, ip) = unsafe { (buf.as_ptr().add(32), buf.as_ptr().add(ib)) };
+            let got = unsafe { parse_event_times(tp, a.len(), ip, b.len(), &mut dc1) };
+            let want = unsafe { (parse_ts(tp, a.len(), &mut dc2), parse_f1_seconds(ip, b.len(), &mut dc2)) };
+            assert_eq!(got, want, "{:?} {:?}", String::from_utf8_lossy(&a), String::from_utf8_lossy(&b));
+            if got.0 != BAD && got.1 != BAD {
+                good += 1;
+            }
+        }
+        assert!(good > 500_000, "{good}");
     }
 
     #[test]

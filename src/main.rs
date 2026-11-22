@@ -842,8 +842,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         let l0 = (fe[0] - fs[0]) as usize;
         let (h1, h2) = hash128(text.add(fs[0] as usize), l0);
         let l1 = (fe[1] - fs[1]) as usize;
-        let t = ts::parse_ts(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize, &mut cx.dc);
-        let ing = ts::parse_f1_seconds(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
+        let (t, ing) = ts::parse_event_times(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize, text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
         let ty = event_type(text.add(fs[4] as usize), (fe[4] - fs[4]) as usize);
         // Fields 1 (user) and 5 (product) must not be empty.
         let mut valid = (empty & 0b10_0010 == 0)
