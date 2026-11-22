@@ -1168,19 +1168,14 @@ struct UserCols {
     cat_valid: Vec<u8>,
 }
 
-/// Totals for one campaign on one day.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Cell {
-    revenue: u64,
-    sessions: u32,
-    purchasing: u32,
-    assisted: u32,
-    pad: u32,
-}
-
+/// Totals per campaign and day. The two counters every attributed session
+/// touches are kept apart from the two only purchases touch, so the busy
+/// part stays small.
 struct Agg {
-    cells: Vec<Cell>,
+    /// [sessions, assisted sessions].
+    hot: Vec<[u32; 2]>,
+    /// (revenue, purchasing sessions).
+    cold: Vec<(u64, u32)>,
 }
 
 struct P3 {
@@ -1216,7 +1211,7 @@ unsafe fn phase3(
     let ndays = sh.ndays;
     let ncat = sh.cat_names.len();
     let cells = (ncamp + 1) * ndays;
-    let mut agg = Agg { cells: vec![Cell::default(); cells] };
+    let mut agg = Agg { hot: vec![[0u32; 2]; cells], cold: vec![(0u64, 0u32); cells] };
     let mut wcnt = vec![0u32; ncamp + 1];
     let mut wpos = vec![0u32; ncamp + 1];
     let mut active: Vec<u32> = Vec::with_capacity(ncamp + 1);
@@ -1446,16 +1441,18 @@ unsafe fn phase3(
                         }
                         cell = cls[best].camp as usize * ndays + d;
                         for &c in active.iter() {
-                            agg.cells.get_unchecked_mut(c as usize * ndays + d).assisted += 1;
+                            agg.hot.get_unchecked_mut(c as usize * ndays + d)[1] += 1;
                         }
                     } else {
                         cell = ncamp * ndays + d;
                     }
                 }
-                let cl = agg.cells.get_unchecked_mut(cell);
-                cl.sessions += 1;
-                cl.purchasing += has as u32;
-                cl.revenue += rev;
+                agg.hot.get_unchecked_mut(cell)[0] += 1;
+                if has {
+                    let c = agg.cold.get_unchecked_mut(cell);
+                    c.0 += rev;
+                    c.1 += 1;
+                }
             }
             if d_sessions > 0 {
                 emit_row(sh, &mut out, name, cur_day, d_sessions, d_events, d_rev, d_has, &mut catsum);
@@ -1983,10 +1980,10 @@ fn finish_outputs(sh: &Shared, p3: &[P3], out_dir: &Path) {
     let mut revenue = vec![0u64; cells];
     for t in p3 {
         for i in 0..cells {
-            sessions[i] += t.agg.cells[i].sessions as u64;
-            purchasing[i] += t.agg.cells[i].purchasing as u64;
-            assisted[i] += t.agg.cells[i].assisted as u64;
-            revenue[i] += t.agg.cells[i].revenue;
+            sessions[i] += t.agg.hot[i][0] as u64;
+            assisted[i] += t.agg.hot[i][1] as u64;
+            revenue[i] += t.agg.cold[i].0;
+            purchasing[i] += t.agg.cold[i].1 as u64;
         }
     }
     let mut c_id = Vec::new();
