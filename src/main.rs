@@ -790,7 +790,12 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let mut nrec = 0usize;
     let mut npend = 0usize;
     let ws = sh.ws;
+    // `t != BAD && ws <= t && t < we` as one unsigned compare: the window
+    // start is raised past BAD (a no-op for any real window), and an empty
+    // or reversed window admits nothing, exactly as the three tests did.
     let we = sh.we;
+    let wlo = ws.max(BAD + 1);
+    let wspan = if we > wlo { we.wrapping_sub(wlo) as u64 } else { 0 };
     let mut it = LineIter::new();
     let mut fs = [0u32; 8];
     let mut fe = [0u32; 8];
@@ -798,22 +803,27 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         if !it.next::<7>(&cx.sb, &mut fs, &mut fe) {
             continue;
         }
-        let l0 = (fe[0] - fs[0]) as usize;
-        if l0 == 0 {
+        // Bit i set when field i is empty: one compare for every length test.
+        let empty = {
+            use std::arch::x86_64::*;
+            let s = _mm256_loadu_si256(fs.as_ptr() as *const __m256i);
+            let e = _mm256_loadu_si256(fe.as_ptr() as *const __m256i);
+            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(s, e))) as u32
+        };
+        if empty & 1 != 0 {
             continue;
         }
+        let l0 = (fe[0] - fs[0]) as usize;
         let (h1, h2) = hash128(text.add(fs[0] as usize), l0);
         let l1 = (fe[1] - fs[1]) as usize;
         let t = ts::parse_ts(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize, &mut cx.dc);
         let ing = ts::parse_f1_seconds(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
         let ty = event_type(text.add(fs[4] as usize), (fe[4] - fs[4]) as usize);
         let l5 = (fe[5] - fs[5]) as usize;
-        let mut valid = (l1 != 0)
-            & (t != BAD)
-            & (t >= ws)
-            & (t < we)
+        // Fields 1 (user) and 5 (product) must not be empty.
+        let mut valid = (empty & 0b10_0010 == 0)
+            & ((t.wrapping_sub(wlo) as u64) < wspan)
             & (ty != 0)
-            & (l5 != 0)
             & (ing != BAD)
             & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY_MS);
         if valid && ty == 2 {
@@ -875,6 +885,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     cx.tm[3] += (t_e - t_d).as_secs_f64();
 }
 
+#[inline(never)]
 unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let t_a = Instant::now();
     scan::scan(text, len, &mut cx.sb);
@@ -885,13 +896,11 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     if cx.pend.capacity() < lines {
         cx.pend = Vec::with_capacity(lines + lines / 2 + 16);
     }
-    if cx.cuid.capacity() < lines {
-        cx.cuid = Vec::with_capacity(lines + lines / 2 + 16);
-    }
     let recs = cx.crecs.as_mut_ptr();
     let pend = cx.pend.as_mut_ptr();
-    let cuid = cx.cuid.as_mut_ptr();
     let mut n = 0usize;
+    let cs = sh.cs;
+    let span = if sh.we > cs { (sh.we - cs) as u64 } else { 0 };
     let mut it = LineIter::new();
     let mut fs = [0u32; 8];
     let mut fe = [0u32; 8];
@@ -905,7 +914,9 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             continue;
         }
         let t = ts::parse_ts(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
-        if t == BAD || t < sh.cs || t >= sh.we {
+        // cs <= t < we as one unsigned compare; BAD (i64::MIN) wraps far out.
+        let d = t.wrapping_sub(cs) as u64;
+        if d >= span {
             continue;
         }
         let camp = match sh.campaigns.get(hash128(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize)) {
@@ -916,24 +927,40 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         let (lo, hi) = hash128(up, l1);
         sh.intern.prefetch(lo);
         *pend.add(n) = Pend { lo, hi, idref: idref(up, l1), rec: n as u32 };
-        *recs.add(n) = Click { ts: (t - sh.cs) as u32, lc: camp, idref: idref(text.add(fs[0] as usize), l0) };
+        *recs.add(n) = Click { ts: d as u32, lc: camp, idref: idref(text.add(fs[0] as usize), l0) };
         n += 1;
     }
-    for i in 0..n {
+    // Intern click i, and file click i - LAG, whose person entry was requested
+    // LAG interns ago. Numbers wait in a small ring instead of a block array.
+    const LAG: usize = 16;
+    #[inline(always)]
+    unsafe fn file_click(sh: &Shared, cl: &mut Wc<Click>, arena: &mut Arena, mut r: Click, uidx: u32) {
+        let person = sh.intern.person(uidx);
+        r.lc |= (person & ((1 << PSHIFT) - 1)) << CAMP_BITS;
+        cl.push(arena, (person >> PSHIFT) as usize, r);
+    }
+    let mut ring = [0u32; LAG];
+    for i in 0..n.min(LAG) {
         let p = *pend.add(i);
         let u = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
         sh.intern.prefetch_person(u);
-        *cuid.add(i) = u;
+        ring[i] = u;
     }
-    for i in 0..n {
-        let mut r = *recs.add(i);
-        let person = sh.intern.person(*cuid.add(i));
-        r.lc |= (person & ((1 << PSHIFT) - 1)) << CAMP_BITS;
-        cx.cl.push(&mut cx.arena, (person >> PSHIFT) as usize, r);
+    for i in LAG..n {
+        let p = *pend.add(i);
+        let u = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
+        sh.intern.prefetch_person(u);
+        // i and i - LAG share a ring slot.
+        let uj = std::mem::replace(ring.get_unchecked_mut(i % LAG), u);
+        file_click(sh, &mut cx.cl, &mut cx.arena, *recs.add(i - LAG), uj);
+    }
+    for j in n.saturating_sub(LAG)..n {
+        file_click(sh, &mut cx.cl, &mut cx.arena, *recs.add(j), *ring.get_unchecked(j % LAG));
     }
     cx.tm[5] += t_a.elapsed().as_secs_f64();
 }
 
+#[inline(never)]
 unsafe fn links_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let t_a = Instant::now();
     scan::scan(text, len, &mut cx.sb);
@@ -979,13 +1006,26 @@ unsafe fn links_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
 
 /// Joins linked IDs into people and names each person. Runs on one thread
 /// once every link line has been parsed.
+#[inline(never)]
 unsafe fn link_people(sh: &Shared) {
     let lists = sh.link_pairs.lock().unwrap();
     let penc = sh.intern.penc;
     let name_enc = sh.intern.name_enc;
     let id_ref = sh.intern.id_ref;
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    // Pairs come in random ID order, so every lookup is a likely cache miss
+    // at full size: request the entries of the pair PF ahead.
+    const PF: usize = 8;
+    #[inline(always)]
+    unsafe fn pf_pair(penc: *mut u32, list: &[(u32, u32)], i: usize) {
+        if let Some(&(a, b)) = list.get(i + PF) {
+            _mm_prefetch::<_MM_HINT_T0>(penc.add(a as usize) as *const i8);
+            _mm_prefetch::<_MM_HINT_T0>(penc.add(b as usize) as *const i8);
+        }
+    }
     for list in lists.iter() {
-        for &(a, b) in list {
+        for (i, &(a, b)) in list.iter().enumerate() {
+            pf_pair(penc, list, i);
             let ra = uf_find(penc, a);
             let rb = uf_find(penc, b);
             if ra != rb {
@@ -993,26 +1033,22 @@ unsafe fn link_people(sh: &Shared) {
             }
         }
     }
+    // Every union is done, so roots no longer change: name each person by its
+    // smallest ID and point each linked ID straight at its root in one pass.
     for list in lists.iter() {
-        for &(a, b) in list {
+        for (i, &(a, b)) in list.iter().enumerate() {
+            pf_pair(penc, list, i);
             for x in [a, b] {
                 let r = uf_find(penc, x);
+                if r != x {
+                    *penc.add(x as usize) = r + 1;
+                }
                 let cur = *name_enc.add(r as usize);
                 let cur_id = if cur == 0 { r } else { cur - 1 };
                 if x != cur_id
                     && id_bytes(*id_ref.add(x as usize)) < id_bytes(*id_ref.add(cur_id as usize))
                 {
                     *name_enc.add(r as usize) = x + 1;
-                }
-            }
-        }
-    }
-    for list in lists.iter() {
-        for &(a, b) in list {
-            for x in [a, b] {
-                let r = uf_find(penc, x);
-                if r != x {
-                    *penc.add(x as usize) = r + 1;
                 }
             }
         }
