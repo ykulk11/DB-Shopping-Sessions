@@ -427,9 +427,13 @@ impl Intern {
     unsafe fn get(&self, st: &mut InternLocal, lo: u64, hi: u64, idref: u64) -> u32 {
         let tag_lo = lo & 0xffff_ffff;
         let tag_hi = hi | 1;
+        // Read once: the atomics below would otherwise make the compiler
+        // reload the fields on every probe.
+        let slots = self.slots;
+        let mask = self.mask;
         let mut i = (lo >> self.shift) as usize;
         loop {
-            let s = &*self.slots.add(i);
+            let s = &*slots.add(i);
             let mut w1 = s[1].load(Ordering::Relaxed);
             if w1 == 0 {
                 if st.next == st.end && !self.refill(st) {
@@ -461,7 +465,7 @@ impl Intern {
                     return (w1 as u32).wrapping_sub(1);
                 }
             }
-            i = (i + 1) & self.mask;
+            i = (i + 1) & mask;
         }
     }
 
@@ -817,7 +821,8 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     // Running row pointer and row reference (rbase + rows so far).
     let mut rp = rows;
     let mut rref = rbase;
-    let mut npend = 0usize;
+    // Running end of the pending lookups; their count is the distance from `pend`.
+    let mut pp = pend;
     let ws = sh.ws;
     // `t != BAD && ws <= t && t < we` as one unsigned compare: the window
     // start is raised past BAD (a no-op for any real window), and an empty
@@ -884,13 +889,14 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             let up = text.add(fs[1] as usize);
             let (lo, hi) = hash128(up, l1);
             sh.intern.prefetch(lo);
-            *pend.add(npend) = Pend { lo, hi, idref: idref(up, l1), rec: rref as u32 };
-            npend += 1;
+            *pp = Pend { lo, hi, idref: idref(up, l1), rec: rref as u32 };
+            pp = pp.add(1);
         }
         rp = rp.add(1);
         rref += 1;
     }
     let t_c = Instant::now();
+    let npend = pp.offset_from(pend) as usize;
     for i in 0..npend {
         let p = *pend.add(i);
         let u = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
@@ -919,9 +925,13 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     }
     let recs = cx.crecs.as_mut_ptr();
     let pend = cx.pend.as_mut_ptr();
-    let mut n = 0usize;
     let cs = sh.cs;
-    let span = if sh.we > cs { (sh.we - cs) as u64 } else { 0 };
+    // Opaque so the compiler keeps the span in one place instead of
+    // redoing `we > cs` on every line.
+    let span = std::hint::black_box(if sh.we > cs { (sh.we - cs) as u64 } else { 0 });
+    // Running output pointers: the next click and its pending intern.
+    let mut rp = recs;
+    let mut pp = pend;
     let mut it = LineIter::new();
     let mut fs = [0u32; 8];
     let mut fe = [0u32; 8];
@@ -931,9 +941,16 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         }
         let l0 = (fe[0] - fs[0]) as usize;
         let l1 = (fe[1] - fs[1]) as usize;
-        if l0 == 0 || l1 == 0 {
+        if (l0 == 0) | (l1 == 0) {
             continue;
         }
+        // Almost every click is kept, so the user ID is hashed and its slot
+        // written before the tests; a dropped click leaves the slot to be
+        // overwritten by the next one (only slots below the final count are read).
+        let up = text.add(fs[1] as usize);
+        let (lo, hi) = hash128(up, l1);
+        sh.intern.prefetch(lo);
+        *pp = Pend { lo, hi, idref: idref(up, l1), rec: 0 };
         let t = ts::parse_ts(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
         // cs <= t < we as one unsigned compare; BAD (i64::MIN) wraps far out.
         let d = t.wrapping_sub(cs) as u64;
@@ -944,13 +961,11 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             Some(c) => c,
             None => continue,
         };
-        let up = text.add(fs[1] as usize);
-        let (lo, hi) = hash128(up, l1);
-        sh.intern.prefetch(lo);
-        *pend.add(n) = Pend { lo, hi, idref: idref(up, l1), rec: n as u32 };
-        *recs.add(n) = Click { ts: d as u32, lc: camp, idref: idref(text.add(fs[0] as usize), l0) };
-        n += 1;
+        *rp = Click { ts: d as u32, lc: camp, idref: idref(text.add(fs[0] as usize), l0) };
+        rp = rp.add(1);
+        pp = pp.add(1);
     }
+    let n = rp.offset_from(recs) as usize;
     // Intern click i, and file click i - LAG, whose person entry was requested
     // LAG interns ago. Numbers wait in a small ring instead of a block array.
     const LAG: usize = 16;
