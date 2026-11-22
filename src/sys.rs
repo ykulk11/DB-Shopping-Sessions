@@ -41,6 +41,7 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
+const MADV_DONTNEED: i32 = 4;
 const MADV_HUGEPAGE: i32 = 14;
 const MAP_POPULATE: i32 = 0x8000;
 
@@ -98,6 +99,17 @@ pub unsafe fn release(p: *mut u8, len: usize) {
     munmap(p as *mut c_void, len);
 }
 
+/// Drops the pages of `[p, p + len)` but keeps the mapping. Unlike munmap,
+/// which takes the mmap lock for writing so that concurrent calls wait for
+/// each other's page-table teardown, MADV_DONTNEED only reads it: threads
+/// can empty different ranges at the same time. The caller must not touch
+/// the range again.
+pub unsafe fn discard(p: *mut u8, len: usize) {
+    if len > 0 {
+        madvise(p as *mut c_void, len, MADV_DONTNEED);
+    }
+}
+
 static mut TOUCH_ONLY: bool = false;
 
 /// For testing the path taken on kernels without MADV_POPULATE_WRITE.
@@ -125,13 +137,14 @@ pub unsafe fn populate_write(p: *mut u8, len: usize) {
 }
 
 impl Mapped {
-    /// Unmaps the file's pages (the caller must not touch them afterwards).
-    pub unsafe fn unmap(&self) {
-        if self.len > 0 {
-            let start = (self.ptr as usize) & !(PAGE - 1);
-            let end = round_up(self.ptr as usize + self.len, PAGE);
-            munmap(start as *mut c_void, end - start);
+    /// The whole pages holding the file's bytes, as (start, length).
+    pub fn pages(&self) -> (usize, usize) {
+        if self.len == 0 {
+            return (0, 0);
         }
+        let start = (self.ptr as usize) & !(PAGE - 1);
+        let end = round_up(self.ptr as usize + self.len, PAGE);
+        (start, end - start)
     }
 }
 
@@ -246,11 +259,9 @@ impl Arena {
         a as *mut u8
     }
 
-    /// Returns every chunk to the kernel; nothing allocated here may be used again.
-    pub unsafe fn unmap_all(&self) {
-        for &(p, len) in &self.chunks {
-            release(p as *mut u8, len);
-        }
+    /// The chunks as (start, length): 2 MB aligned, whole multiples of 2 MB.
+    pub fn chunks(&self) -> &[(usize, usize)] {
+        &self.chunks
     }
 
     pub unsafe fn release_all(&mut self) {

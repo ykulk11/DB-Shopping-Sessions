@@ -377,12 +377,16 @@ impl Intern {
         }
     }
 
-    /// Returns the tables to the kernel without touching the struct.
-    unsafe fn unmap(&self) {
-        sys::release(self.slots as *mut u8, self.bytes);
-        sys::release(self.id_ref as *mut u8, self.limit as usize * 8);
-        sys::release(self.penc as *mut u8, self.limit as usize * 4);
-        sys::release(self.name_enc as *mut u8, self.limit as usize * 4);
+    /// The tables as (start, length), each rounded up to the 2 MB its
+    /// mapping was rounded to, so dropping them splits no huge page.
+    fn ranges(&self) -> [(usize, usize); 4] {
+        let r = |p: usize, len: usize| (p, (len + (2 << 20) - 1) & !((2 << 20) - 1));
+        [
+            r(self.slots as usize, self.bytes),
+            r(self.id_ref as usize, self.limit as usize * 8),
+            r(self.penc as usize, self.limit as usize * 4),
+            r(self.name_enc as usize, self.limit as usize * 4),
+        ]
     }
 
     unsafe fn free(&mut self) {
@@ -2847,32 +2851,63 @@ fn main() {
     });
     let t_p3 = t0.elapsed();
 
-    // Give the big mappings back in parallel while the last file is written:
-    // otherwise the kernel tears them down on one core as the process exits.
-    let teardown = std::env::var("PIPE_NO_TEARDOWN").is_err();
-    let tear_done = AtomicUsize::new(0);
-    let tear_ref = &tear_done;
+    // Drop the big mappings' pages in parallel while campaign_daily is
+    // written: otherwise the kernel tears them down on one core as the
+    // process exits. MADV_DONTNEED rather than munmap, because munmap takes
+    // the mmap lock for writing: parallel munmaps (and any allocation in
+    // finish_outputs) would queue behind each other's page-table teardown.
+    // The work is cut into pieces of at most 16 MB and handed out from a
+    // queue, file pages first (they cost per 4 KB page; the arenas and
+    // tables are huge pages), so every thread finishes at about the same
+    // time. The emptied mappings themselves go at exit.
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    if std::env::var("PIPE_NO_TEARDOWN").is_err() {
+        const PIECE: usize = 16 << 20;
+        let mut add = |p: usize, len: usize| {
+            let mut at = 0;
+            while at < len {
+                let n = PIECE.min(len - at);
+                pieces.push((p + at, n));
+                at += n;
+            }
+        };
+        for f in sh.files.iter() {
+            let (p, len) = f.pages();
+            add(p, len);
+        }
+        for t in p1.iter() {
+            for &(p, len) in t.arena.chunks() {
+                add(p, len);
+            }
+        }
+        for t in p2.iter() {
+            for &(p, len) in t.arena.chunks() {
+                add(p, len);
+            }
+        }
+        for (p, len) in sh.intern.ranges() {
+            add(p, len);
+        }
+    }
+    let next_piece = AtomicUsize::new(0);
+    let tear = || loop {
+        let i = next_piece.fetch_add(1, Ordering::Relaxed);
+        if i >= pieces.len() {
+            break;
+        }
+        let (p, len) = pieces[i];
+        unsafe { sys::discard(p as *mut u8, len) };
+    };
+    let tear = &tear;
     std::thread::scope(|s| {
-        if teardown {
-            for tid in 0..pp.threads {
-                s.spawn(move || unsafe {
-                    p1r[tid].arena.unmap_all();
-                    p2r[tid].arena.unmap_all();
-                    for (j, f) in shr.files.iter().enumerate() {
-                        if j % pp.threads == tid {
-                            f.unmap();
-                        }
-                    }
-                    if tid == 0 {
-                        shr.intern.unmap();
-                    }
-                    tear_ref.fetch_add(1, Ordering::Relaxed);
-                });
+        if !pieces.is_empty() {
+            for _ in 0..pp.threads {
+                s.spawn(move || tear());
             }
         }
         finish_outputs(shr, &p3, out_ref);
+        tear();
     });
-    let _ = tear_done.load(Ordering::Relaxed);
 
     if timing {
         eprintln!("phase2 dedup {:.1} ms, scatter {:.1} ms", (t_p2a - t_p1).as_secs_f64() * 1e3, (t_p2 - t_p2a).as_secs_f64() * 1e3);
