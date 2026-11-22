@@ -4,3 +4,4 @@ dev/
 *.parquet
 tools/refimpl/target/
 __pycache__/
+.claude/

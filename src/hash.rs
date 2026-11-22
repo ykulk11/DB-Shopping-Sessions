@@ -20,22 +20,43 @@ unsafe fn key(k: (i64, i64)) -> __m128i {
     _mm_set_epi64x(k.1, k.0)
 }
 
+const LEN_MUL: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// `K0 ^ [len * LEN_MUL, len]` for the lengths up to 48, so the short paths
+/// start with one load instead of building the length vector.
+#[repr(C, align(16))]
+struct Start([[u64; 2]; 49]);
+
+static START: Start = {
+    let mut t = [[0u64; 2]; 49];
+    let mut len = 0;
+    while len < 49 {
+        t[len] = [K0.0 as u64 ^ (len as u64).wrapping_mul(LEN_MUL), K0.1 as u64 ^ len as u64];
+        len += 1;
+    }
+    Start(t)
+};
+
+#[inline(always)]
+unsafe fn start(len: usize) -> __m128i {
+    _mm_load_si128(START.0.as_ptr().add(len) as *const __m128i)
+}
+
 /// Hash of `len` bytes at `p`. May read up to 16 bytes past the end.
 #[inline(always)]
 pub unsafe fn hash128(p: *const u8, len: usize) -> (u64, u64) {
-    let lenv = _mm_set_epi64x(len as i64, (len as i64).wrapping_mul(0x9e37_79b9_7f4a_7c15u64 as i64));
     let mut s;
     if len <= 16 {
         let m = _mm_loadu_si128(MASKS.as_ptr().add(16 - len) as *const __m128i);
         let v = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), m);
-        s = _mm_xor_si128(_mm_xor_si128(v, key(K0)), lenv);
+        s = _mm_xor_si128(v, start(len));
         s = _mm_aesenc_si128(s, key(K1));
         s = _mm_aesenc_si128(s, key(K2));
         s = _mm_aesenc_si128(s, key(K3));
     } else if len <= 32 {
         let a = _mm_loadu_si128(p as *const __m128i);
         let b = _mm_loadu_si128(p.add(len - 16) as *const __m128i);
-        s = _mm_xor_si128(_mm_xor_si128(a, key(K0)), lenv);
+        s = _mm_xor_si128(a, start(len));
         s = _mm_aesenc_si128(s, key(K1));
         s = _mm_aesenc_si128(_mm_xor_si128(s, b), key(K2));
         s = _mm_aesenc_si128(s, key(K3));
@@ -44,13 +65,14 @@ pub unsafe fn hash128(p: *const u8, len: usize) -> (u64, u64) {
         let a = _mm_loadu_si128(p as *const __m128i);
         let b = _mm_loadu_si128(p.add(16) as *const __m128i);
         let c = _mm_loadu_si128(p.add(len - 16) as *const __m128i);
-        s = _mm_xor_si128(_mm_xor_si128(a, key(K0)), lenv);
+        s = _mm_xor_si128(a, start(len));
         s = _mm_aesenc_si128(s, key(K1));
         s = _mm_aesenc_si128(_mm_xor_si128(s, b), key(K2));
         s = _mm_aesenc_si128(_mm_xor_si128(s, c), key(K3));
         s = _mm_aesenc_si128(s, key(K4));
         s = _mm_aesenc_si128(s, key(K1));
     } else {
+        let lenv = _mm_set_epi64x(len as i64, (len as u64).wrapping_mul(LEN_MUL) as i64);
         s = _mm_xor_si128(key(K0), lenv);
         let mut off = 0;
         while off + 16 <= len {
@@ -121,5 +143,96 @@ impl StaticTable {
             }
             i = (i + 1) & self.mask;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hash as it was before the length table, kept verbatim as the reference.
+    unsafe fn hash128_old(p: *const u8, len: usize) -> (u64, u64) {
+        let lenv = _mm_set_epi64x(len as i64, (len as i64).wrapping_mul(0x9e37_79b9_7f4a_7c15u64 as i64));
+        let mut s;
+        if len <= 16 {
+            let m = _mm_loadu_si128(MASKS.as_ptr().add(16 - len) as *const __m128i);
+            let v = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), m);
+            s = _mm_xor_si128(_mm_xor_si128(v, key(K0)), lenv);
+            s = _mm_aesenc_si128(s, key(K1));
+            s = _mm_aesenc_si128(s, key(K2));
+            s = _mm_aesenc_si128(s, key(K3));
+        } else if len <= 32 {
+            let a = _mm_loadu_si128(p as *const __m128i);
+            let b = _mm_loadu_si128(p.add(len - 16) as *const __m128i);
+            s = _mm_xor_si128(_mm_xor_si128(a, key(K0)), lenv);
+            s = _mm_aesenc_si128(s, key(K1));
+            s = _mm_aesenc_si128(_mm_xor_si128(s, b), key(K2));
+            s = _mm_aesenc_si128(s, key(K3));
+            s = _mm_aesenc_si128(s, key(K4));
+        } else if len <= 48 {
+            let a = _mm_loadu_si128(p as *const __m128i);
+            let b = _mm_loadu_si128(p.add(16) as *const __m128i);
+            let c = _mm_loadu_si128(p.add(len - 16) as *const __m128i);
+            s = _mm_xor_si128(_mm_xor_si128(a, key(K0)), lenv);
+            s = _mm_aesenc_si128(s, key(K1));
+            s = _mm_aesenc_si128(_mm_xor_si128(s, b), key(K2));
+            s = _mm_aesenc_si128(_mm_xor_si128(s, c), key(K3));
+            s = _mm_aesenc_si128(s, key(K4));
+            s = _mm_aesenc_si128(s, key(K1));
+        } else {
+            s = _mm_xor_si128(key(K0), lenv);
+            let mut off = 0;
+            while off + 16 <= len {
+                let v = _mm_loadu_si128(p.add(off) as *const __m128i);
+                s = _mm_aesenc_si128(_mm_xor_si128(s, v), key(K1));
+                s = _mm_aesenc_si128(s, key(K2));
+                off += 16;
+            }
+            let rest = len - off;
+            if rest > 0 {
+                let m = _mm_loadu_si128(MASKS.as_ptr().add(16 - rest) as *const __m128i);
+                let v = _mm_and_si128(_mm_loadu_si128(p.add(off) as *const __m128i), m);
+                s = _mm_aesenc_si128(_mm_xor_si128(s, v), key(K3));
+            }
+            s = _mm_aesenc_si128(s, key(K4));
+            s = _mm_aesenc_si128(s, key(K1));
+            s = _mm_aesenc_si128(s, key(K2));
+        }
+        (_mm_cvtsi128_si64(s) as u64, _mm_extract_epi64::<1>(s) as u64)
+    }
+
+    #[test]
+    fn hash_matches_old_code() {
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // The input is a prefix of random bytes; the bytes after it vary too,
+        // which checks they are still ignored.
+        let mut buf = [0u8; 96 + 16];
+        let mut n = 0u64;
+        for round in 0..4_000_000u32 {
+            for w in buf.chunks_mut(8) {
+                let r = next().to_le_bytes();
+                w.copy_from_slice(&r[..w.len()]);
+            }
+            if round % 4 == 0 {
+                // ID-like bytes: lowercase base 36 and hex characters.
+                for b in buf.iter_mut() {
+                    *b = b"0123456789abcdefghijklmnopqrstuvwxyz"[(*b % 36) as usize];
+                }
+            }
+            for len in [(round % 81) as usize, 9, 33] {
+                let new = unsafe { hash128(buf.as_ptr(), len) };
+                let old = unsafe { hash128_old(buf.as_ptr(), len) };
+                assert_eq!(new, old, "len {len} bytes {:?}", &buf[..len]);
+                n += 1;
+            }
+        }
+        // About 49,000 inputs of each length 0..=80, plus 4 million each of 9 and 33.
+        assert!(n >= 12_000_000);
     }
 }

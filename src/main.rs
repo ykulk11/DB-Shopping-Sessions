@@ -558,70 +558,54 @@ const PSHIFT: u32 = 12;
 
 /// Walks the lines of a scanned block.
 struct LineIter {
+    /// Index in `seps` of the newline before the next line.
     k: usize,
-    ci: usize,
-    ls: u32,
-    qprev: u32,
+    /// Lines handed out so far.
+    line: usize,
 }
 
 impl LineIter {
     fn new() -> Self {
-        LineIter { k: 0, ci: 0, ls: 0, qprev: 0 }
+        LineIter { k: 0, line: 0 }
     }
 
-    /// Advances to the next line (the caller checks `k < lines` first) and
-    /// fills the bounds of its `N` fields. Returns false when the line does
-    /// not have exactly `N` fields or has a double quote anywhere except
-    /// around a whole field.
+    /// Advances to the next line (the caller checks `line < lines` first) and
+    /// fills the bounds of its `N` fields, quotes stripped. Returns false
+    /// when the line does not have exactly `N` fields or has a double quote
+    /// anywhere except around a whole field. `N` is at most 7.
     #[inline(always)]
-    unsafe fn next<const N: usize>(
-        &mut self,
-        sb: &scan::ScanBuf,
-        text: *const u8,
-        fs: &mut [u32; N],
-        fe: &mut [u32; N],
-    ) -> bool {
-        let le = *sb.nls.as_ptr().add(self.k);
-        self.k += 1;
-        let qend = sb.quotes_before(le);
-        let ql = qend - self.qprev;
-        self.qprev = qend;
-        let ls = self.ls;
-        self.ls = le + 1;
-        let c = sb.commas.as_ptr().add(self.ci);
-        // Exactly N - 1 commas before the newline.
-        if !(*c.add(N - 2) < le && *c.add(N - 1) > le) {
-            let mut ci = self.ci;
-            while *sb.commas.as_ptr().add(ci) < le {
-                ci += 1;
+    unsafe fn next<const N: usize>(&mut self, sb: &scan::ScanBuf, fs: &mut [u32; 8], fe: &mut [u32; 8]) -> bool {
+        use std::arch::x86_64::*;
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        self.line += 1;
+        let k = self.k;
+        let sf = sb.sf.as_ptr();
+        // Flags of the separator before each field, and of the one after it.
+        let a = (sf.add(k) as *const u64).read_unaligned();
+        let b = (sf.add(k + 1) as *const u64).read_unaligned();
+        let fields = (1u64 << (8 * N)) - 1;
+        // The first newline is the Nth separator, and no field has a bad quote.
+        let shape = (b & (ONES * (scan::F_NL | scan::F_BAD) as u64) & fields) ^ (1u64 << (8 * (N - 1)));
+        // A field opens with a quote exactly when it closes with one.
+        let pairs = ((a >> 1) ^ (b >> 2)) & ONES & fields;
+        if (shape | pairs) != 0 {
+            let mut j = k + 1;
+            while *sf.add(j) & scan::F_NL == 0 {
+                j += 1;
             }
-            self.ci = ci;
+            self.k = j;
             return false;
         }
-        self.ci += N - 1;
-        if ql == 0 {
-            fs[0] = ls;
-            for j in 1..N {
-                let at = *c.add(j - 1);
-                fe[j - 1] = at;
-                fs[j] = at + 1;
-            }
-            fe[N - 1] = le;
-            return true;
-        }
-        let mut total = 0u32;
-        let mut bad = 0u32;
-        for j in 0..N {
-            let s = if j == 0 { ls } else { *c.add(j - 1) + 1 };
-            let e = if j == N - 1 { le } else { *c.add(j) };
-            let q = (*text.add(s as usize) == b'"') as u32;
-            let closed = ((e - s >= 2) & (*text.offset(e as isize - 1) == b'"')) as u32;
-            bad |= q & (closed ^ 1);
-            fs[j] = s + q;
-            fe[j] = e - q;
-            total += q;
-        }
-        bad == 0 && total * 2 == ql
+        self.k = k + N;
+        let seps = sb.seps.as_ptr();
+        let before = _mm256_loadu_si256(seps.add(k) as *const __m256i);
+        let after = _mm256_loadu_si256(seps.add(k + 1) as *const __m256i);
+        let qa = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(((a >> 1) & ONES) as i64));
+        let qb = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(((b >> 2) & ONES) as i64));
+        let start = _mm256_add_epi32(_mm256_sub_epi32(before, _mm256_set1_epi32(-1)), qa);
+        _mm256_storeu_si256(fs.as_mut_ptr() as *mut __m256i, start);
+        _mm256_storeu_si256(fe.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(after, qb));
+        true
     }
 }
 
@@ -721,10 +705,10 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let ws = sh.ws;
     let we = sh.we;
     let mut it = LineIter::new();
-    let mut fs = [0u32; 7];
-    let mut fe = [0u32; 7];
-    while it.k < lines {
-        if !it.next::<7>(&cx.sb, text, &mut fs, &mut fe) {
+    let mut fs = [0u32; 8];
+    let mut fe = [0u32; 8];
+    while it.line < lines {
+        if !it.next::<7>(&cx.sb, &mut fs, &mut fe) {
             continue;
         }
         let l0 = (fe[0] - fs[0]) as usize;
@@ -812,10 +796,10 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let cuid = cx.cuid.as_mut_ptr();
     let mut n = 0usize;
     let mut it = LineIter::new();
-    let mut fs = [0u32; 4];
-    let mut fe = [0u32; 4];
-    while it.k < lines {
-        if !it.next::<4>(&cx.sb, text, &mut fs, &mut fe) {
+    let mut fs = [0u32; 8];
+    let mut fe = [0u32; 8];
+    while it.line < lines {
+        if !it.next::<4>(&cx.sb, &mut fs, &mut fe) {
             continue;
         }
         let l0 = (fe[0] - fs[0]) as usize;
@@ -863,10 +847,10 @@ unsafe fn links_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let pend = cx.pend.as_mut_ptr();
     let mut n = 0usize;
     let mut it = LineIter::new();
-    let mut fs = [0u32; 2];
-    let mut fe = [0u32; 2];
-    while it.k < lines {
-        if !it.next::<2>(&cx.sb, text, &mut fs, &mut fe) {
+    let mut fs = [0u32; 8];
+    let mut fe = [0u32; 8];
+    while it.line < lines {
+        if !it.next::<2>(&cx.sb, &mut fs, &mut fe) {
             continue;
         }
         let l0 = (fe[0] - fs[0]) as usize;
@@ -1644,10 +1628,10 @@ unsafe fn lookup_rows<'a>(m: &'a Mapped) -> Vec<(&'a [u8], &'a [u8])> {
     let mut sb = scan::ScanBuf::new();
     scan::scan(text, len, &mut sb);
     let mut it = LineIter::new();
-    let mut fs = [0u32; 2];
-    let mut fe = [0u32; 2];
-    while it.k < sb.lines {
-        if !it.next::<2>(&sb, text, &mut fs, &mut fe) {
+    let mut fs = [0u32; 8];
+    let mut fe = [0u32; 8];
+    while it.line < sb.lines {
+        if !it.next::<2>(&sb, &mut fs, &mut fe) {
             continue;
         }
         rows.push((
