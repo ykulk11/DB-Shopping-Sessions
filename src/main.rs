@@ -517,7 +517,7 @@ struct Shared {
     ws_mod_day: u64,
     day0: i32,
     ndays: usize,
-    products: StaticTable,
+    products: Products,
     cat_names: Vec<Vec<u8>>,
     unknown_cat: u32,
     campaigns: StaticTable,
@@ -547,6 +547,88 @@ impl Shared {
     fn pin(&self, tid: usize) {
         if !self.pin.is_empty() {
             sys::pin_to(self.pin[tid % self.pin.len()]);
+        }
+    }
+}
+
+/// product_id -> category. When every ID in products.csv is `p` followed by
+/// a decimal number without leading zeros (as generated catalogs are), a
+/// byte per number answers the lookup from a table that stays in cache;
+/// otherwise, and for every ID when that is not so, the hash table does.
+struct Products {
+    /// Category + 1 by product number, 0 for none; empty when not usable.
+    direct: Vec<u8>,
+    table: StaticTable,
+}
+
+/// The number of an ID of the form `p` + 1 to 7 decimal digits with no
+/// leading zero (`p0` is fine), else `None`. Distinct IDs of that form have
+/// distinct numbers. May read up to 8 bytes past the ID.
+#[inline(always)]
+unsafe fn product_number(p: *const u8, len: usize) -> Option<usize> {
+    if len < 2 || len > 8 || *p != b'p' {
+        return None;
+    }
+    let nd = len - 1;
+    let mask = (1u64 << (8 * nd)) - 1;
+    // Digits become their values; the first digit is the lowest byte.
+    let x = ((p.add(1) as *const u64).read_unaligned() ^ 0x3030_3030_3030_3030) & mask;
+    if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 & mask != 0 {
+        return None;
+    }
+    if nd > 1 && x & 0xff == 0 {
+        return None;
+    }
+    let mut v = 0usize;
+    for i in 0..nd {
+        v = v * 10 + ((x >> (8 * i)) & 0xff) as usize;
+    }
+    Some(v)
+}
+
+impl Products {
+    fn new(rows: &[(&[u8], &[u8])], cat_of: impl Fn(&[u8]) -> u32) -> Self {
+        let mut table = StaticTable::new(rows.len());
+        let mut numbers = Vec::with_capacity(rows.len());
+        let mut direct_ok = std::env::var("PIPE_NO_DIRECT").is_err();
+        for (id, cat) in rows {
+            let c = cat_of(cat);
+            // The mapped file is readable well past any ID.
+            table.insert(unsafe { hash128(id.as_ptr(), id.len()) }, c);
+            match unsafe { product_number(id.as_ptr(), id.len()) } {
+                Some(n) if c < 255 => numbers.push((n, c)),
+                _ => direct_ok = false,
+            }
+        }
+        let mut direct = Vec::new();
+        let top = numbers.iter().map(|x| x.0).max().unwrap_or(0);
+        // Only for a dense catalog, where the byte table is the smaller one.
+        if direct_ok && !numbers.is_empty() && top < rows.len() * 8 + 4096 {
+            direct = vec![0u8; top + 1];
+            for &(n, c) in &numbers {
+                // The first row for an ID counts, as in the hash table.
+                if direct[n] == 0 {
+                    direct[n] = c as u8 + 1;
+                }
+            }
+        }
+        Products { direct, table }
+    }
+
+    /// The category of a product ID, or `unknown`.
+    #[inline(always)]
+    unsafe fn get(&self, p: *const u8, len: usize, unknown: u32) -> u32 {
+        if !self.direct.is_empty() {
+            return match product_number(p, len) {
+                Some(n) if n < self.direct.len() && *self.direct.get_unchecked(n) != 0 => {
+                    *self.direct.get_unchecked(n) as u32 - 1
+                }
+                _ => unknown,
+            };
+        }
+        match self.table.get(hash128(p, len)) {
+            Some(c) => c,
+            None => unknown,
         }
     }
 }
@@ -736,10 +818,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             if price == 0 {
                 valid = false;
             } else {
-                let cat = match sh.products.get(hash128(text.add(fs[5] as usize), l5)) {
-                    Some(c) => c,
-                    None => sh.unknown_cat,
-                };
+                let cat = sh.products.get(text.add(fs[5] as usize), l5, sh.unknown_cat);
                 cx.pur.push((first + nrec as u32, price | (cat << 24)));
             }
         }
@@ -1804,11 +1883,8 @@ fn main() {
         padded.extend_from_slice(&[0u8; 64]);
         cat_rank.insert(unsafe { hash128(padded.as_ptr(), c.len()) }, i as u32);
     }
-    let mut products = StaticTable::new(product_rows.len());
-    for (id, cat) in &product_rows {
-        let c = cat_rank.get(unsafe { hash128(cat.as_ptr(), cat.len()) }).unwrap();
-        products.insert(unsafe { hash128(id.as_ptr(), id.len()) }, c);
-    }
+    let products =
+        Products::new(&product_rows, |cat| cat_rank.get(unsafe { hash128(cat.as_ptr(), cat.len()) }).unwrap());
     let mut campaigns = StaticTable::new(campaign_rows.len());
     let mut camp_names = Vec::with_capacity(campaign_rows.len());
     let mut camp_channels = Vec::with_capacity(campaign_rows.len());
@@ -2168,6 +2244,87 @@ mod tests {
             }
         }
         Some(out)
+    }
+
+    /// The direct product table must answer exactly like the hash table, for
+    /// catalog IDs and for every near miss of one.
+    #[test]
+    fn product_lookup_matches_hash_table() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // IDs live in one padded buffer, as they do in a mapped file.
+        let mut store = vec![0u8; 1 << 23];
+        let base = store.as_mut_ptr();
+        let mut used = 64usize;
+        let mut put = |bytes: &[u8]| -> (usize, usize) {
+            let at = used;
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(at), bytes.len()) };
+            used += bytes.len() + 24;
+            (at, bytes.len())
+        };
+        let mut catalog = Vec::new();
+        for _ in 0..40_000 {
+            let n = next() % 60_000;
+            catalog.push((put(format!("p{n}").as_bytes()), (next() % 7) as u32));
+        }
+        catalog.push((put(b"p0"), 3));
+        let mut probes = Vec::new();
+        for _ in 0..200_000 {
+            let n = next() % 70_000;
+            let text = match next() % 12 {
+                0 => format!("p0{n}"),
+                1 => format!("P{n}"),
+                2 => format!(" p{n}"),
+                3 => format!("p{n} "),
+                4 => format!("p{n}\r"),
+                5 => format!("q{n}"),
+                6 => format!("p{}", n * 100_003),
+                7 => format!("p{n}a"),
+                8 => String::from("p"),
+                9 => String::new(),
+                _ => format!("p{n}"),
+            };
+            probes.push(put(text.as_bytes()));
+        }
+        probes.push(put("p１２".as_bytes()));
+        probes.push(put(b"p-1"));
+        probes.push(put(b"p+1"));
+        probes.push(put(b"p00"));
+        probes.push(put(b"p0"));
+        let rows: Vec<(&[u8], &[u8])> = catalog
+            .iter()
+            .map(|&((at, len), _)| (unsafe { std::slice::from_raw_parts(base.add(at), len) }, &b"x"[..]))
+            .collect();
+        let cats: Vec<u32> = catalog.iter().map(|c| c.1).collect();
+        let idx = std::cell::Cell::new(0usize);
+        let products = Products::new(&rows, |_| {
+            let i = idx.get();
+            idx.set(i + 1);
+            cats[i]
+        });
+        assert!(!products.direct.is_empty(), "the direct table should be in use");
+        for &(at, len) in probes.iter().chain(catalog.iter().map(|c| &c.0)) {
+            let p = unsafe { base.add(at) };
+            let want = match products.table.get(unsafe { hash128(p, len) }) {
+                Some(c) => c,
+                None => 99,
+            };
+            let got = unsafe { products.get(p, len, 99) };
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }));
+        }
+        // A catalog with one ID of another shape falls back to the hash table.
+        let odd = put(b"sku-7");
+        let mut rows2 = rows.clone();
+        rows2.push((unsafe { std::slice::from_raw_parts(base.add(odd.0), odd.1) }, &b"x"[..]));
+        let fallback = Products::new(&rows2, |_| 1);
+        assert!(fallback.direct.is_empty());
+        assert_eq!(unsafe { fallback.get(base.add(odd.0), odd.1, 99) }, 1);
+        assert!(used < store.len());
     }
 
     /// Random blocks over a small alphabet: the scan and the splitter must

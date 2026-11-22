@@ -38,6 +38,7 @@ check "dev, 3 threads, touch" devcmp PIPE_TOUCH=1 PIPE_THREADS=3
 check "dev, 1 thread" devcmp PIPE_THREADS=1
 check "dev, dedup split forced" devcmp PIPE_SPLIT_ROWS=200
 check "dev, 4 KB blocks, pinned" devcmp PIPE_BLOCK_KB=4 PIPE_PIN=1
+check "dev, hash product table" devcmp PIPE_NO_DIRECT=1
 check "seed 2 vs python reference" tools/xcheck.sh /home/user/scratch-agents/audit-semantics/data-s2 s2
 check "seed 3 vs python reference" tools/xcheck.sh /home/user/scratch-agents/audit-semantics/data-s3 s3
 if [ "$MODE" = full ]; then
