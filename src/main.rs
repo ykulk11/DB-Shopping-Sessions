@@ -720,6 +720,9 @@ struct P1 {
     rows: RowStore,
     /// (row number, price and category) of this thread's purchases, in row order.
     pur: Vec<(u32, u32)>,
+    /// (row number, ingest_ts in seconds) of rows whose ingest_ts is too far
+    /// from the window for `Row::ing`, in row order.
+    far: Vec<(u32, i64)>,
     /// Per event-hash partition: 32 hash bits and a row reference per row.
     fp: Wc<u64>,
     /// This thread's number + 1, shifted into place for row references.
@@ -822,10 +825,23 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
                 cx.pur.push((first + nrec as u32, price | (cat << 24)));
             }
         }
+        // Seconds from the base. 0 and MAX - 1 stand for "further away than
+        // fits" (never the case for a timestamp near the window); the exact
+        // value of such a row is kept on the side for dedup.
         let ing_key = if ing == BAD {
             u32::MAX
         } else {
-            (ing - sh.ing_base).clamp(0, u32::MAX as i64 - 1) as u32
+            let d = ing - sh.ing_base;
+            if d >= 1 && d <= u32::MAX as i64 - 2 {
+                d as u32
+            } else {
+                cx.far.push((first + nrec as u32, ing));
+                if d < 1 {
+                    0
+                } else {
+                    u32::MAX - 1
+                }
+            }
         };
         let tsv = if valid { (t - ws) as u32 | VALID } else { 0 };
         *rows.add(nrec) = Row { uidx: u32::MAX, tsv, ing: ing_key, h2: h2 as u32 };
@@ -1018,6 +1034,7 @@ unsafe fn phase1(sh: &Shared, tid: usize, threads: usize) -> P1 {
         arena,
         rows: RowStore { chunks: Vec::new() },
         pur: Vec::new(),
+        far: Vec::new(),
         fp,
         ref_base: ((tid + 1) as u32) << (ROW_BITS + 10),
         cl,
@@ -1100,6 +1117,20 @@ unsafe impl Sync for P2 {}
 
 /// Phase 2a: dedup on event_id within event-hash partitions. Of the rows
 /// with one event_id, all but the one with the smallest ingest_ts are cleared.
+/// The ingest_ts in seconds of a row whose `Row::ing` holds one of the two
+/// "too far away" values.
+#[cold]
+#[inline(never)]
+unsafe fn exact_ingest(p1: &[P1], r: u32) -> i64 {
+    let t = (r >> (ROW_BITS + 10)) as usize - 1;
+    let number = r & ((1 << (ROW_BITS + 10)) - 1);
+    let far = &p1.get_unchecked(t).far;
+    match far.binary_search_by_key(&number, |x| x.0) {
+        Ok(i) => far[i].1,
+        Err(_) => 0,
+    }
+}
+
 /// The hash table of one dedup bucket: fingerprints, 0 for an empty slot.
 struct DedupTable {
     slots: Vec<u64>,
@@ -1162,7 +1193,13 @@ impl DedupTable {
                     let a = row_ptr(p1, s as u32);
                     let b = row_ptr(p1, fp as u32);
                     if (*a).h2 == (*b).h2 {
-                        if (*b).ing < (*a).ing {
+                        let (ia, ib) = ((*a).ing, (*b).ing);
+                        let b_first = if ia == ib && (ia == 0 || ia == u32::MAX - 1) {
+                            exact_ingest(p1, fp as u32) < exact_ingest(p1, s as u32)
+                        } else {
+                            ib < ia
+                        };
+                        if b_first {
                             (*a).tsv = 0;
                             *tab.add(i) = fp;
                         } else {

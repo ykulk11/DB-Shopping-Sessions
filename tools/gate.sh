@@ -18,11 +18,15 @@ check() {
   name=$1; shift
   out=$("$@" 2>&1 | tail -1)
   case "$out" in
-    MATCH|*"36/36 fixtures passed"*|*"failures=0"*|*"test result: ok"*) printf '%-32s ok   %s\n' "$name" "$out" ;;
+    MATCH|*"fixtures all passed"*|*"failures=0"*|*"test result: ok"*) printf '%-32s ok   %s\n' "$name" "$out" ;;
     *) printf '%-32s FAIL %s\n' "$name" "$out"; fail=1 ;;
   esac
 }
 units() { cargo test --release 2>&1 | grep "test result"; }
+fixtures() {
+  python3 scripts/run_fixtures.py fixtures -- "$P" | tail -1 |
+    awk '{ split($1, a, "/"); if (a[1] == a[2] && a[1] >= 37) print "fixtures all passed (" $1 ")"; else print "FIXTURES " $0 }'
+}
 devcmp() {
   rm -rf "$X/gate-dev"
   env "$@" "$P" /home/user/data/dev "$X/gate-dev" && python3 scripts/compare.py "$X/gate-dev" /home/user/data/dev-answer
@@ -30,7 +34,7 @@ devcmp() {
 fuzz() { python3 tools/fuzz/run.py "$1" "$2" --scale "$3" --keep-going --pipeline "$P" --work "$X/fuzz" | grep SUMMARY; }
 fuzzalt() { PIPE_SPLIT_ROWS=16 PIPE_BLOCK_KB=4 PIPE_PE_BITS=3 fuzz "$@"; }
 check "unit tests" units
-check "fixtures" python3 scripts/run_fixtures.py fixtures -- "$P"
+check "fixtures" fixtures
 check "dev answer" devcmp
 check "dev, restart path" devcmp PIPE_CAP_BITS=15
 check "dev, no huge pages, 8 threads" devcmp PIPE_NO_HUGE=1 PIPE_THREADS=8
