@@ -57,6 +57,105 @@ unsafe fn mark_bad(sf: *mut u8, s: u64, mut badq: u64, pending: bool) -> bool {
     carry
 }
 
+/// Separator, newline and quote masks of the 64 bytes at `p`.
+#[inline(always)]
+unsafe fn masks(p: *const u8, comma: __m256i, newline: __m256i, quote: __m256i) -> (u64, u64, u64) {
+    let v0 = _mm256_loadu_si256(p as *const __m256i);
+    let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let cm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, comma)) as u32 as u64)
+        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, comma)) as u32 as u64) << 32);
+    let nm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, newline)) as u32 as u64)
+        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, newline)) as u32 as u64) << 32);
+    let qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, quote)) as u32 as u64)
+        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, quote)) as u32 as u64) << 32);
+    (cm | nm, nm, qm)
+}
+
+/// Writer state of `scan`.
+struct Out {
+    /// Next position slot and next flag slot.
+    dp: *mut u32,
+    df: *mut u8,
+    /// Separator and quote masks of the previous word (only bit 63 is used).
+    ps: u64,
+    pq: u64,
+    /// 1 when a field with a bad quote runs past the previous word.
+    pend: u64,
+}
+
+/// Records the separators of one word. `s`, `nm`, `qm`: separator, newline
+/// and quote masks of the word; `xs`, `xq`: bit 0 says whether the byte
+/// after the word is a separator, or a quote (other bits are ignored);
+/// `base`: the word's offset in all eight lanes.
+#[inline(always)]
+unsafe fn word(o: &mut Out, s: u64, nm: u64, qm: u64, xs: u64, xq: u64, base: __m256i) {
+    let after_sep = (s << 1) | (o.ps >> 63);
+    let before_sep = (s >> 1) | (xs << 63);
+    // Flag sources; pext with mask `s` looks only at separator bits.
+    let qa = (qm >> 1) | (xq << 63);
+    let qb = (qm << 1) | (o.pq >> 63);
+    o.ps = s;
+    o.pq = qm;
+
+    // Positions: eight slots are written whether or not they are all used.
+    let k = s.count_ones() as usize;
+    let mut t = s;
+    let mut p = [0u32; 8];
+    for j in 0..8 {
+        p[j] = t.trailing_zeros();
+        t &= t.wrapping_sub(1);
+    }
+    let pv = _mm256_loadu_si256(p.as_ptr() as *const __m256i);
+    _mm256_storeu_si256(o.dp as *mut __m256i, _mm256_add_epi32(pv, base));
+    // Flags, one byte per separator, in the same order.
+    let nl_bits = _pext_u64(nm, s);
+    let qa_bits = _pext_u64(qa, s);
+    let qb_bits = _pext_u64(qb, s);
+    // One mask constant for all three; the bit planes do not overlap, so
+    // the sum is their union.
+    let fl = _pdep_u64(nl_bits, ONES) + _pdep_u64(qa_bits, ONES) * 2 + _pdep_u64(qb_bits, ONES) * 4;
+    (o.df as *mut u64).write_unaligned(fl);
+    if k > 8 {
+        let b = _mm256_extract_epi32::<0>(base) as u32;
+        let mut j = 8;
+        while t != 0 {
+            *o.dp.add(j) = b + t.trailing_zeros();
+            t &= t - 1;
+            *o.df.add(j) = ((nl_bits >> j) & 1) as u8
+                | (((qa_bits >> j) & 1) << 1) as u8
+                | (((qb_bits >> j) & 1) << 2) as u8;
+            j += 1;
+        }
+    }
+    // A quote is fine only right after a separator or right before one,
+    // and not both (that field would be a single quote).
+    let badq = qm & !(after_sep ^ before_sep);
+    if (badq | o.pend) != 0 {
+        o.pend = mark_bad(o.df, s, badq, o.pend != 0) as u64;
+    }
+    o.dp = o.dp.add(k);
+    o.df = o.df.add(k);
+}
+
+/// Number of flag bytes in `[p, e)` with F_NL set.
+#[inline(always)]
+unsafe fn count_nl(mut p: *const u8, e: *const u8) -> usize {
+    let bit = _mm256_set1_epi8(F_NL as i8);
+    let mut acc = _mm256_setzero_si256();
+    while p.add(32) <= e {
+        let v = _mm256_and_si256(_mm256_loadu_si256(p as *const __m256i), bit);
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(v, _mm256_setzero_si256()));
+        p = p.add(32);
+    }
+    let h = _mm_add_epi64(_mm256_castsi256_si128(acc), _mm256_extracti128_si256::<1>(acc));
+    let mut n = (_mm_cvtsi128_si64(h) + _mm_extract_epi64::<1>(h)) as usize;
+    while p < e {
+        n += (*p & F_NL) as usize;
+        p = p.add(1);
+    }
+    n
+}
+
 /// Scans `len` bytes at `text`. The block must end right after a newline.
 /// Reads up to 64 bytes past the end.
 #[inline(never)]
@@ -69,91 +168,48 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
     let sf = sb.sf.as_mut_ptr();
     *seps = u32::MAX;
     *sf = F_NL | if *text == b'"' { F_QA } else { 0 };
-    let mut ns = 1usize;
-    let mut lines = 0usize;
-    // Whether the byte before the current word is a separator, or a quote.
-    let mut prev_s = 1u64;
-    let mut prev_q = 0u64;
-    let mut bad_pending = false;
+    // The byte before the block counts as a separator.
+    let mut o = Out { dp: seps.add(1), df: sf.add(1), ps: 1 << 63, pq: 0, pend: 0 };
     let comma = _mm256_set1_epi8(b',' as i8);
     let newline = _mm256_set1_epi8(b'\n' as i8);
     let quote = _mm256_set1_epi8(b'"' as i8);
-    let mut i = 0usize;
-    while i < len {
-        // Ask for the text a little ahead: across a page boundary the
-        // hardware prefetcher starts over, and this covers the gap.
-        _mm_prefetch::<_MM_HINT_T0>(text.add(i + PREFETCH_AHEAD) as *const i8);
-        let v0 = _mm256_loadu_si256(text.add(i) as *const __m256i);
-        let v1 = _mm256_loadu_si256(text.add(i + 32) as *const __m256i);
-        let mut cm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, comma)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, comma)) as u32 as u64) << 32);
-        let mut nm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, newline)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, newline)) as u32 as u64) << 32);
-        let mut qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, quote)) as u32 as u64)
-            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, quote)) as u32 as u64) << 32);
-        let rem = len - i;
-        if rem < 64 {
+    let step = _mm256_set1_epi32(64);
+    let mut base = _mm256_setzero_si256();
+    if len != 0 {
+        let mut p = text;
+        let (mut s, mut nm, mut qm) = masks(p, comma, newline, quote);
+        // Whole words. The masks of the following word (which reach at most
+        // 63 bytes past the block) tell what the byte after this one is.
+        let whole = text.add(len & !63);
+        while p < whole {
+            // Ask for the text a little ahead: across a page boundary the
+            // hardware prefetcher starts over, and this covers the gap.
+            _mm_prefetch::<_MM_HINT_T0>(p.add(PREFETCH_AHEAD) as *const i8);
+            let (s2, nm2, qm2) = masks(p.add(64), comma, newline, quote);
+            word(&mut o, s, nm, qm, s2, qm2, base);
+            s = s2;
+            nm = nm2;
+            qm = qm2;
+            base = _mm256_add_epi32(base, step);
+            p = p.add(64);
+        }
+        let rem = len & 63;
+        if rem != 0 {
+            // The last, partial word. The byte after it is never looked at:
+            // the block's last byte is a newline, not a quote.
             let keep = (1u64 << rem) - 1;
-            cm &= keep;
-            nm &= keep;
-            qm &= keep;
+            let nb = *p.add(64);
+            let xs = ((nb == b',') | (nb == b'\n')) as u64;
+            let xq = (nb == b'"') as u64;
+            word(&mut o, s & keep, nm & keep, qm & keep, xs, xq, base);
         }
-        let s = cm | nm;
-        // The byte after this word. Past the block it is never looked at:
-        // the block's last byte is a newline, not a quote.
-        let nb = *text.add(i + 64);
-        let next_s = ((nb == b',') | (nb == b'\n')) as u64;
-        let next_q = (nb == b'"') as u64;
-        let after_sep = (s << 1) | prev_s;
-        let before_sep = (s >> 1) | (next_s << 63);
-        let qa = s & ((qm >> 1) | (next_q << 63));
-        let qb = s & ((qm << 1) | prev_q);
-        prev_s = s >> 63;
-        prev_q = qm >> 63;
-        let base = i as u32;
-
-        // Positions: eight slots are written whether or not they are all used.
-        let k = s.count_ones() as usize;
-        let dst = seps.add(ns);
-        let mut t = s;
-        for j in 0..8 {
-            *dst.add(j) = base + t.trailing_zeros();
-            t &= t.wrapping_sub(1);
-        }
-        // Flags, one byte per separator, in the same order.
-        let nl_bits = _pext_u64(nm, s);
-        let qa_bits = _pext_u64(qa, s);
-        let qb_bits = _pext_u64(qb, s);
-        let fl = _pdep_u64(nl_bits, ONES)
-            | _pdep_u64(qa_bits, ONES << 1)
-            | _pdep_u64(qb_bits, ONES << 2);
-        (sf.add(ns) as *mut u64).write_unaligned(fl);
-        if k > 8 {
-            let mut j = 8;
-            while t != 0 {
-                *dst.add(j) = base + t.trailing_zeros();
-                t &= t - 1;
-                *sf.add(ns + j) = ((nl_bits >> j) & 1) as u8
-                    | (((qa_bits >> j) & 1) << 1) as u8
-                    | (((qb_bits >> j) & 1) << 2) as u8;
-                j += 1;
-            }
-        }
-        // A quote is fine only right after a separator or right before one,
-        // and not both (that field would be a single quote).
-        let badq = qm & !(after_sep ^ before_sep);
-        if (badq != 0) | bad_pending {
-            bad_pending = mark_bad(sf.add(ns), s, badq, bad_pending);
-        }
-        ns += k;
-        lines += nm.count_ones() as usize;
-        i += 64;
     }
+    let ns = o.dp.offset_from(seps) as usize;
+    sb.lines = count_nl(sf.add(1), sf.add(ns));
     for j in 0..16 {
         *seps.add(ns + j) = u32::MAX;
         *sf.add(ns + j) = F_NL;
     }
-    sb.lines = lines;
 }
 
 /// Offset of the first `\n` at or after `from`, or `len` when there is none.
