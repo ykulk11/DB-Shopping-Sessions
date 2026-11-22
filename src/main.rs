@@ -429,16 +429,99 @@ impl Intern {
         true
     }
 
-    /// The number for an ID, assigning a new one on first sight.
+    /// The number for an ID, assigning a new one on first sight. The probe
+    /// starts at the first slot of the home slot's 64-byte line and looks at
+    /// whole lines: slots are claimed in order within a line, so the claimed
+    /// slots of a line are always a prefix of it.
     #[inline(always)]
     unsafe fn get(&self, st: &mut InternLocal, lo: u64, hi: u64, idref: u64) -> u32 {
+        use std::arch::x86_64::*;
+        let line = self.slots.add(((lo >> self.shift) as usize) & !3);
+        let v = line as *const __m256i;
+        let a = std::ptr::read_volatile(v);
+        let b = std::ptr::read_volatile(v.add(1));
+        std::sync::atomic::compiler_fence(Ordering::Acquire);
+        let th = _mm256_set1_epi64x((hi | 1) as i64);
+        let m = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, th))) as u32
+            | ((_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, th))) as u32) << 4))
+            & 0x55;
+        if m != 0 {
+            let w1 = (*line.add((m.trailing_zeros() >> 1) as usize))[1].load(Ordering::Relaxed);
+            let d = (w1 ^ (lo << 32)).wrapping_sub(1);
+            if d < 0xffff_ffff {
+                return d as u32;
+            }
+        }
+        self.get_slow(st, lo, hi, idref)
+    }
+
+    /// The rest of a lookup: the ID is not published in its home line.
+    #[inline(never)]
+    unsafe fn get_slow(&self, st: &mut InternLocal, lo: u64, hi: u64, idref: u64) -> u32 {
+        use std::arch::x86_64::*;
         let tag_lo = lo & 0xffff_ffff;
         let tag_hi = hi | 1;
-        // Read once: the atomics below would otherwise make the compiler
-        // reload the fields on every probe.
         let slots = self.slots;
         let mask = self.mask;
-        let mut i = (lo >> self.shift) as usize;
+        let mut i = ((lo >> self.shift) as usize) & !3;
+        let th = _mm256_set1_epi64x(tag_hi as i64);
+        let tl = _mm256_set1_epi32(tag_lo as i32);
+        let zero = _mm256_setzero_si256();
+        loop {
+            let line = slots.add(i);
+            let v = line as *const __m256i;
+            let a = std::ptr::read_volatile(v);
+            let b = std::ptr::read_volatile(v.add(1));
+            std::sync::atomic::compiler_fence(Ordering::Acquire);
+            let m = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, th))) as u32
+                | ((_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, th))) as u32) << 4))
+                & 0x55;
+            if m != 0 {
+                let w1 = (*line.add((m.trailing_zeros() >> 1) as usize))[1].load(Ordering::Relaxed);
+                let d = (w1 ^ (lo << 32)).wrapping_sub(1);
+                if d < 0xffff_ffff {
+                    return d as u32;
+                }
+                return self.get_scalar(st, tag_lo, tag_hi, idref, i);
+            }
+            // A claim of this ID whose second word is not written yet, or a
+            // different ID with the same low tag: the exact slot-by-slot path.
+            let t = (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, tl))) as u32
+                | ((_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(b, tl))) as u32) << 8))
+                & 0x8888;
+            if t != 0 {
+                return self.get_scalar(st, tag_lo, tag_hi, idref, i);
+            }
+            let e = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, zero))) as u32
+                | ((_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, zero))) as u32) << 4))
+                & 0xaa;
+            if e == 0 {
+                i = (i + 4) & mask;
+                continue;
+            }
+            let s = &*line.add((e.trailing_zeros() >> 1) as usize);
+            if st.next == st.end && !self.refill(st) {
+                return 0;
+            }
+            let idx = st.next;
+            *self.id_ref.add(idx as usize) = idref;
+            if s[1]
+                .compare_exchange(0, (tag_lo << 32) | (idx as u64 + 1), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                s[0].store(tag_hi, Ordering::Release);
+                st.next += 1;
+                return idx;
+            }
+        }
+    }
+
+    /// Slot by slot from slot `i`, the first of a line.
+    #[cold]
+    #[inline(never)]
+    unsafe fn get_scalar(&self, st: &mut InternLocal, tag_lo: u64, tag_hi: u64, idref: u64, mut i: usize) -> u32 {
+        let slots = self.slots;
+        let mask = self.mask;
         loop {
             let s = &*slots.add(i);
             let mut w1 = s[1].load(Ordering::Relaxed);
