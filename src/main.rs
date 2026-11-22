@@ -1320,10 +1320,15 @@ unsafe fn phase1(sh: &Shared, tid: usize, threads: usize) -> P1 {
             let pairs = std::mem::take(&mut cx.links);
             sh.link_pairs.lock().unwrap().push(pairs);
             if sh.links_done.fetch_add(1, Ordering::AcqRel) + 1 == sh.n_link_chunks {
-                let t_a = Instant::now();
-                link_people(sh);
-                sh.links_ready.store(true, Ordering::Release);
-                cx.tm[4] += t_a.elapsed().as_secs_f64();
+                // An attempt in which the ID table filled up is void, and its
+                // pairs may name IDs that were never stored: it is not linked,
+                // and `links_ready` stays false, so no click is filed either.
+                if !sh.intern.overflow.load(Ordering::Relaxed) {
+                    let t_a = Instant::now();
+                    link_people(sh);
+                    sh.links_ready.store(true, Ordering::Release);
+                    cx.tm[4] += t_a.elapsed().as_secs_f64();
+                }
             }
         }
     }
