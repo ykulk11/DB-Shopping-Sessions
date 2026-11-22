@@ -813,7 +813,9 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let shift = 24 - sh.pe_bits;
     let rbase = (cx.ref_base | first) as u64;
     let pend = cx.pend.as_mut_ptr();
-    let mut nrec = 0usize;
+    // Running row pointer and row reference (rbase + rows so far).
+    let mut rp = rows;
+    let mut rref = rbase;
     let mut npend = 0usize;
     let ws = sh.ws;
     // `t != BAD && ws <= t && t < we` as one unsigned compare: the window
@@ -821,7 +823,10 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     // or reversed window admits nothing, exactly as the three tests did.
     let we = sh.we;
     let wlo = ws.max(BAD + 1);
-    let wspan = if we > wlo { we.wrapping_sub(wlo) as u64 } else { 0 };
+    // Opaque so the compiler keeps the span instead of redoing `we > wlo`
+    // on every line.
+    let wspan = std::hint::black_box(if we > wlo { we.wrapping_sub(wlo) as u64 } else { 0 });
+    let ing_base = sh.ing_base;
     let mut it = LineIter::new();
     let mut fs = [0u32; 8];
     let mut fe = [0u32; 8];
@@ -851,46 +856,48 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             & (ing != BAD)
             & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY_MS);
         if valid && ty == 2 {
-            valid = purchase(sh, &mut cx.pur, text, &fs, &fe, first + nrec as u32);
+            valid = purchase(sh, &mut cx.pur, text, &fs, &fe, first + (rref - rbase) as u32);
         }
         // Seconds from the base. 0 and MAX - 1 stand for "further away than
         // fits" (never the case for a timestamp near the window); the exact
         // value of such a row is kept on the side for dedup.
-        let ing_key = if ing == BAD {
+        // BAD minus any base (ws / 1000 - 2^31) is far outside 1..=MAX-2, so
+        // the range test comes first and BAD is sorted out on the rare path.
+        let d = ing.wrapping_sub(ing_base);
+        let ing_key = if (d.wrapping_sub(1) as u64) < u32::MAX as u64 - 2 {
+            d as u32
+        } else if ing == BAD {
             u32::MAX
         } else {
-            let d = ing - sh.ing_base;
-            if d >= 1 && d <= u32::MAX as i64 - 2 {
-                d as u32
-            } else {
-                far_ing(&mut cx.far, first + nrec as u32, ing, d)
-            }
+            far_ing(&mut cx.far, first + (rref - rbase) as u32, ing, d)
         };
         let tsv = if valid { (t - ws) as u32 | VALID } else { 0 };
-        *rows.add(nrec) = Row { uidx: u32::MAX, tsv, ing: ing_key, h2: h2 as u32 };
+        *rp = Row { uidx: u32::MAX, tsv, ing: ing_key, h2: h2 as u32 };
         // Hash bits 8..40 as the tag, the row reference below.
         cx.fp.push(
             &mut cx.arena,
             ((h1 >> 40) as usize) >> shift,
-            ((h1 << 24) & 0xffff_ffff_0000_0000) | (rbase + nrec as u64),
+            ((h1 << 24) & 0xffff_ffff_0000_0000) | rref,
         );
         if valid {
             let up = text.add(fs[1] as usize);
             let (lo, hi) = hash128(up, l1);
             sh.intern.prefetch(lo);
-            *pend.add(npend) = Pend { lo, hi, idref: idref(up, l1), rec: nrec as u32 };
+            *pend.add(npend) = Pend { lo, hi, idref: idref(up, l1), rec: rref as u32 };
             npend += 1;
         }
-        nrec += 1;
+        rp = rp.add(1);
+        rref += 1;
     }
     let t_c = Instant::now();
     for i in 0..npend {
         let p = *pend.add(i);
         let u = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
-        (*rows.add(p.rec as usize)).uidx = u;
+        // `rec` holds the low half of the row reference.
+        (*rows.add(p.rec.wrapping_sub(rbase as u32) as usize)).uidx = u;
     }
     let t_d = Instant::now();
-    cx.rows.commit(nrec);
+    cx.rows.commit((rref - rbase) as usize);
     let t_e = Instant::now();
     cx.tm[0] += (t_b - t_a).as_secs_f64();
     cx.tm[1] += (t_c - t_b).as_secs_f64();
