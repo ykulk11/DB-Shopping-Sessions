@@ -2747,6 +2747,27 @@ fn main() {
         },
     };
 
+    // EXPERIMENT (not for merging): touch 2 GiB of fresh memory with every
+    // thread, then give it back. This build's time minus the time of the
+    // same commit without it is what 2 GiB of fresh pages cost.
+    unsafe {
+        let len = 2usize << 30;
+        let p = sys::anon_huge(len) as usize;
+        std::thread::scope(|s| {
+            for k in 0..threads {
+                s.spawn(move || {
+                    let per = len / threads;
+                    let st = p + k * per;
+                    let mut o = 0;
+                    while o < per {
+                        std::ptr::write_volatile((st + o) as *mut u8, 1);
+                        o += 4096;
+                    }
+                });
+            }
+        });
+        sys::release(p as *mut u8, len);
+    }
     // Phase 1, repeated with a larger ID table in the unlikely case it fills.
     let mut p1: Vec<P1>;
     loop {
