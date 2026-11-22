@@ -89,7 +89,12 @@ pub struct DateCache {
 
 impl DateCache {
     pub fn new() -> Self {
-        DateCache { a: [0; 64], b: [0; 64], base: [0; 64] }
+        // Every slot starts as a real entry ("1970-01-01T", midnight = 0), so a
+        // hit always means the 11 bytes are a valid date; an all-zero start
+        // would turn 11 NUL bytes into 1970-01-01.
+        let a = u64::from_le_bytes(*b"1970-01-");
+        let b = u32::from_le_bytes(*b"-01T");
+        DateCache { a: [a; 64], b: [b; 64], base: [0; 64] }
     }
 }
 
@@ -516,6 +521,33 @@ mod tests {
         }
         assert_ne!(ts("2000-02-29T00:00:00Z"), BAD);
         assert_ne!(ts("2028-02-29T00:00:00Z"), BAD);
+    }
+
+    #[test]
+    fn zero_bytes_are_not_a_date() {
+        // A fresh cache must not take 11 NUL bytes for a cached date: its slots
+        // once started as all zeros, which read them as 1970-01-01.
+        let nul = |rest: &str| {
+            let mut s = vec![0u8; 11];
+            s.extend_from_slice(rest.as_bytes());
+            s
+        };
+        let ing = padded(b"1970-01-01T10:05:00Z");
+        for s in [nul("10:00:00Z"), nul("10:00:00+02:00"), nul("10:00:00-00:00")] {
+            let buf = padded(&s);
+            let t = unsafe { parse_ts(buf.as_ptr().add(32), s.len(), &mut DateCache::new()) };
+            assert_eq!(t, BAD, "{s:?}");
+            let (t, _) = unsafe {
+                parse_event_times(buf.as_ptr().add(32), s.len(), ing.as_ptr().add(32), 20, &mut DateCache::new())
+            };
+            assert_eq!(t, BAD, "event {s:?}");
+        }
+        let s = nul("10:00:00");
+        let buf = padded(&s);
+        assert_eq!(unsafe { datetime19c(buf.as_ptr().add(32), &mut DateCache::new()) }, BAD);
+        // The entry every slot starts with is a real date.
+        let ok = padded(b"1970-01-01T10:00:00Z");
+        assert_eq!(unsafe { parse_ts(ok.as_ptr().add(32), 20, &mut DateCache::new()) }, 36_000_000);
     }
 
     /// Scalar `HH:MM:SS` / `HH:MM` references for the SWAR fast paths.
