@@ -1,0 +1,16 @@
+[package]
+name = "refimpl"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace root, so the pipeline's manifest above never applies to it.
+[workspace]
+
+[[bin]]
+name = "refimpl"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+overflow-checks = true
+debug = false

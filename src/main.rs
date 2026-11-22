@@ -40,22 +40,64 @@ const KIND_CLICKS: u8 = 2;
 // Records
 // ---------------------------------------------------------------------------
 
-/// One parsed event row, before dedup. Exactly half a cache line.
-#[repr(C, align(8))]
+/// One parsed event row, kept in arrival order in the parsing thread's row store.
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct EvRec {
-    /// The two halves of the event_id hash.
-    h1: u64,
-    h2: u64,
-    /// ingest_ts in seconds from a fixed base; `u32::MAX` when unparsable.
-    ing: u32,
+struct Row {
     /// Interned user ID (only meaningful when valid).
     uidx: u32,
     /// `VALID | (ts - window_start)` in ms when the row passes validation and
-    /// the late rule, else 0.
+    /// the late rule, else 0. Dedup clears it on the copies that lose.
     tsv: u32,
-    /// For a purchase: price in the low 24 bits, category in the high 8. Else 0.
-    pc: u32,
+    /// ingest_ts in seconds from a fixed base; `u32::MAX` when unparsable.
+    ing: u32,
+    /// 32 bits of the event_id hash, to confirm that two rows are the same event.
+    h2: u32,
+}
+
+/// Rows per chunk of a row store (2 MB), and the layout of a row reference:
+/// thread number + 1 in the top 5 bits, chunk in the next 10, row in the low 17.
+const ROW_BITS: u32 = 17;
+const ROW_CHUNK: usize = 1 << ROW_BITS;
+const ROW_CHUNKS_MAX: usize = 1 << 10;
+const MAX_THREADS: usize = 31;
+
+struct RowStore {
+    /// (first row, rows used) per chunk.
+    chunks: Vec<(*mut Row, u32)>,
+}
+
+impl RowStore {
+    /// Room for `n` consecutive rows: a pointer to the first and its number in this store.
+    #[inline(always)]
+    unsafe fn reserve(&mut self, arena: &mut Arena, n: usize) -> (*mut Row, u32) {
+        let full = match self.chunks.last() {
+            Some(&(_, used)) => used as usize + n > ROW_CHUNK,
+            None => true,
+        };
+        if full {
+            if n > ROW_CHUNK || self.chunks.len() == ROW_CHUNKS_MAX {
+                sys::die("row store limit exceeded");
+            }
+            let p = arena.alloc(ROW_CHUNK * size_of::<Row>(), 4096) as *mut Row;
+            self.chunks.push((p, 0));
+        }
+        let c = self.chunks.len() - 1;
+        let (base, used) = *self.chunks.get_unchecked(c);
+        (base.add(used as usize), ((c as u32) << ROW_BITS) | used)
+    }
+
+    #[inline(always)]
+    unsafe fn commit(&mut self, n: usize) {
+        self.chunks.last_mut().unwrap_unchecked().1 += n as u32;
+    }
+}
+
+#[inline(always)]
+unsafe fn row_ptr(p1: &[P1], r: u32) -> *mut Row {
+    let t = (r >> (ROW_BITS + 10)) as usize - 1;
+    let c = ((r >> ROW_BITS) & (ROW_CHUNKS_MAX as u32 - 1)) as usize;
+    p1.get_unchecked(t).rows.chunks.get_unchecked(c).0.add((r & (ROW_CHUNK as u32 - 1)) as usize)
 }
 
 /// A valid click, stored in its person's partition.
@@ -529,12 +571,20 @@ unsafe fn event_type(p: *const u8, len: usize) -> u32 {
 struct P1 {
     sb: scan::ScanBuf,
     dc: ts::DateCache,
-    recs: Vec<EvRec>,
+    /// event_id hash (low half) of each row of the current block.
+    hs: Vec<u64>,
     pend: Vec<Pend>,
     crecs: Vec<Click>,
     il: InternLocal,
     arena: Arena,
-    ev: Wc<EvRec>,
+    /// Every event row this thread parsed, in order.
+    rows: RowStore,
+    /// (row number, price and category) of this thread's purchases, in row order.
+    pur: Vec<(u32, u32)>,
+    /// Per event-hash partition: 32 hash bits and a row reference per row.
+    fp: Wc<u64>,
+    /// This thread's number + 1, shifted into place for row references.
+    ref_base: u32,
     /// Valid clicks by person partition.
     cl: Wc<Click>,
     cuid: Vec<u32>,
@@ -588,11 +638,14 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     scan::scan(text, len, &mut cx.sb);
     let t_b = Instant::now();
     let lines = cx.sb.lines;
-    if cx.recs.capacity() < lines {
-        cx.recs = Vec::with_capacity(lines + lines / 2 + 16);
+    if cx.hs.capacity() < lines {
+        cx.hs = Vec::with_capacity(lines + lines / 2 + 16);
+    }
+    if cx.pend.capacity() < lines {
         cx.pend = Vec::with_capacity(lines + lines / 2 + 16);
     }
-    let recs = cx.recs.as_mut_ptr();
+    let (rows, first) = cx.rows.reserve(&mut cx.arena, lines);
+    let hs = cx.hs.as_mut_ptr();
     let pend = cx.pend.as_mut_ptr();
     let mut nrec = 0usize;
     let mut npend = 0usize;
@@ -623,7 +676,6 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             & (l5 != 0)
             & (ing != BAD)
             & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY_MS);
-        let mut pc = 0u32;
         if valid && ty == 2 {
             let price = ts::parse_price(text.add(fs[6] as usize), (fe[6] - fs[6]) as usize);
             if price == 0 {
@@ -633,7 +685,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
                     Some(c) => c,
                     None => sh.unknown_cat,
                 };
-                pc = price | (cat << 24);
+                cx.pur.push((first + nrec as u32, price | (cat << 24)));
             }
         }
         let ing_key = if ing == BAD {
@@ -642,7 +694,8 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             (ing - sh.ing_base).clamp(0, u32::MAX as i64 - 1) as u32
         };
         let tsv = if valid { (t - ws) as u32 | VALID } else { 0 };
-        *recs.add(nrec) = EvRec { h1, h2, ing: ing_key, uidx: u32::MAX, tsv, pc };
+        *rows.add(nrec) = Row { uidx: u32::MAX, tsv, ing: ing_key, h2: h2 as u32 };
+        *hs.add(nrec) = h1;
         if valid {
             let up = text.add(fs[1] as usize);
             let (lo, hi) = hash128(up, l1);
@@ -656,15 +709,18 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     for i in 0..npend {
         let p = *pend.add(i);
         let u = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
-        (*recs.add(p.rec as usize)).uidx = u;
+        (*rows.add(p.rec as usize)).uidx = u;
     }
     let t_d = Instant::now();
     let shift = 24 - sh.pe_bits;
+    let rbase = (cx.ref_base | first) as u64;
     for i in 0..nrec {
-        let r = *recs.add(i);
-        let part = ((r.h1 >> 40) as usize) >> shift;
-        cx.ev.push(&mut cx.arena, part, r);
+        let h1 = *hs.add(i);
+        let part = ((h1 >> 40) as usize) >> shift;
+        // Hash bits 8..40 as the tag, the row reference below.
+        cx.fp.push(&mut cx.arena, part, ((h1 << 24) & 0xffff_ffff_0000_0000) | (rbase + i as u64));
     }
+    cx.rows.commit(nrec);
     let t_e = Instant::now();
     cx.tm[0] += (t_b - t_a).as_secs_f64();
     cx.tm[1] += (t_c - t_b).as_secs_f64();
@@ -816,20 +872,23 @@ unsafe fn link_people(sh: &Shared) {
     }
 }
 
-unsafe fn phase1(sh: &Shared) -> P1 {
+unsafe fn phase1(sh: &Shared, tid: usize) -> P1 {
     let pe = 1usize << sh.pe_bits;
     let mut arena = Arena::new();
-    let ev = Wc::new(pe, &mut arena);
+    let fp = Wc::new(pe, &mut arena);
     let cl = Wc::new(sh.np, &mut arena);
     let mut cx = P1 {
         sb: scan::ScanBuf::new(),
         dc: ts::DateCache::new(),
-        recs: Vec::new(),
+        hs: Vec::new(),
         pend: Vec::new(),
         crecs: Vec::new(),
         il: InternLocal { next: 0, end: 0 },
         arena,
-        ev,
+        rows: RowStore { chunks: Vec::new() },
+        pur: Vec::new(),
+        fp,
+        ref_base: ((tid + 1) as u32) << (ROW_BITS + 10),
         cl,
         cuid: Vec::new(),
         links: Vec::new(),
@@ -883,7 +942,7 @@ unsafe fn phase1(sh: &Shared) -> P1 {
             }
         }
     }
-    cx.ev.finish(&mut cx.arena);
+    cx.fp.finish(&mut cx.arena);
     cx.cl.finish(&mut cx.arena);
     cx
 }
@@ -908,21 +967,17 @@ struct P2 {
 unsafe impl Send for P2 {}
 unsafe impl Sync for P2 {}
 
-unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize) -> P2 {
-    let mut arena = Arena::new();
-    let ev = Wc::new(sh.np, &mut arena);
-    let pu = Wc::new(sh.np, &mut arena);
-    let mut out = P2 { arena, ev, pu };
+/// Phase 2a: dedup on event_id within event-hash partitions. Of the rows
+/// with one event_id, all but the one with the smallest ingest_ts are cleared.
+unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
     let pe = 1usize << sh.pe_bits;
     let mut table: Vec<u64> = Vec::new();
-    const TAG: u64 = 0xffff_0000_0000_0000;
-    const PTR: u64 = 0x0000_ffff_ffff_ffff;
     loop {
         let item = next.fetch_add(1, Ordering::Relaxed);
         if item >= pe {
             break;
         }
-        let total: usize = p1.iter().map(|t| t.ev.count(item)).sum();
+        let total: usize = p1.iter().map(|t| t.fp.count(item)).sum();
         if total == 0 {
             continue;
         }
@@ -935,26 +990,26 @@ unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize) -> P2 {
         let mask = tsize - 1;
         let tab = table.as_mut_ptr();
         for t in p1 {
-            t.ev.for_each(item, |r| {
-                let h1 = (*r).h1;
-                let h2 = (*r).h2;
-                let tag = ((h1 >> 24) & 0xffff) << 48;
-                let mut i = (h1 as usize) & mask;
+            t.fp.for_each(item, |q| {
+                let fp = *q;
+                let tag = fp >> 32;
+                let mut i = (tag as usize) & mask;
                 loop {
                     let s = *tab.add(i);
                     if s == 0 {
-                        *tab.add(i) = tag | r as u64;
+                        *tab.add(i) = fp;
                         break;
                     }
-                    if s & TAG == tag {
-                        let o = (s & PTR) as *mut EvRec;
-                        if (*o).h1 == h1 && (*o).h2 == h2 {
+                    if s >> 32 == tag {
+                        let a = row_ptr(p1, s as u32);
+                        let b = row_ptr(p1, fp as u32);
+                        if (*a).h2 == (*b).h2 {
                             // Same event_id: the smaller ingest_ts stays.
-                            if (*r).ing < (*o).ing {
-                                (*o).tsv = 0;
-                                *tab.add(i) = tag | r as u64;
+                            if (*b).ing < (*a).ing {
+                                (*a).tsv = 0;
+                                *tab.add(i) = fp;
                             } else {
-                                (*r).tsv = 0;
+                                (*b).tsv = 0;
                             }
                             break;
                         }
@@ -963,26 +1018,43 @@ unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize) -> P2 {
                 }
             });
         }
-        for t in p1 {
-            t.ev.for_each_block(item, |base, n| {
-                for i in 0..n {
-                    if i + 12 < n {
-                        sh.intern.prefetch_person((*base.add(i + 12)).uidx);
-                    }
-                    let r = base.add(i);
-                    let tsv = (*r).tsv;
-                    if tsv & VALID != 0 {
-                        let person = sh.intern.person((*r).uidx);
-                        let part = (person >> PSHIFT) as usize;
-                        let ts = tsv & !VALID;
-                        out.ev.push(&mut out.arena, part, PEv { person, ts });
-                        let pc = (*r).pc;
-                        if pc != 0 {
-                            out.pu.push(&mut out.arena, part, PPu { person, ts, pc, pad: 0 });
-                        }
-                    }
+    }
+}
+
+/// Phase 2b: scatter the surviving events (and purchases) by person.
+unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &AtomicUsize) -> P2 {
+    let mut arena = Arena::new();
+    let ev = Wc::new(sh.np, &mut arena);
+    let pu = Wc::new(sh.np, &mut arena);
+    let mut out = P2 { arena, ev, pu };
+    loop {
+        let item = next.fetch_add(1, Ordering::Relaxed);
+        if item >= units.len() {
+            break;
+        }
+        let (t, c) = units[item];
+        let src = &p1[t as usize];
+        let (base, used) = src.rows.chunks[c as usize];
+        let used = used as usize;
+        let first = c << ROW_BITS;
+        let pur = &src.pur;
+        let mut pcur = pur.partition_point(|x| x.0 < first);
+        for i in 0..used {
+            if i + 16 < used {
+                sh.intern.prefetch_person((*base.add(i + 16)).uidx);
+            }
+            let r = *base.add(i);
+            let is_pur = pcur < pur.len() && pur.get_unchecked(pcur).0 == first + i as u32;
+            if r.tsv & VALID != 0 {
+                let person = sh.intern.person(r.uidx);
+                let part = (person >> PSHIFT) as usize;
+                let ts = r.tsv & !VALID;
+                out.ev.push(&mut out.arena, part, PEv { person, ts });
+                if is_pur {
+                    out.pu.push(&mut out.arena, part, PPu { person, ts, pc: pur.get_unchecked(pcur).1, pad: 0 });
                 }
-            });
+            }
+            pcur += is_pur as usize;
         }
     }
     out.ev.finish(&mut out.arena);
@@ -1526,7 +1598,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
-        .max(1);
+        .clamp(1, MAX_THREADS);
     if std::env::var("PIPE_POPULATE").is_ok() {
         sys::set_populate(true);
     }
@@ -1650,7 +1722,7 @@ fn main() {
     loop {
         let shr = &sh;
         p1 = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..threads).map(|_| s.spawn(move || unsafe { phase1(shr) })).collect();
+            let hs: Vec<_> = (0..threads).map(|tid| s.spawn(move || unsafe { phase1(shr, tid) })).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         if !sh.intern.overflow.load(Ordering::Relaxed) {
@@ -1678,8 +1750,22 @@ fn main() {
     let next = AtomicUsize::new(0);
     let shr = &sh;
     let p1r = &p1;
+    std::thread::scope(|s| {
+        for _ in 0..pp.threads {
+            s.spawn(|| unsafe { phase2_dedup(shr, p1r, &next) });
+        }
+    });
+    let t_p2a = t0.elapsed();
+    let mut units: Vec<(u32, u32)> = Vec::new();
+    for (t, th) in p1.iter().enumerate() {
+        for c in 0..th.rows.chunks.len() {
+            units.push((t as u32, c as u32));
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let unitsr = &units;
     let p2: Vec<P2> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..pp.threads).map(|_| s.spawn(|| unsafe { phase2(shr, p1r, &next) })).collect();
+        let hs: Vec<_> = (0..pp.threads).map(|_| s.spawn(|| unsafe { phase2_scatter(shr, p1r, unitsr, &next) })).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let t_p2 = t0.elapsed();
@@ -1724,6 +1810,7 @@ fn main() {
     let _ = tear_done.load(Ordering::Relaxed);
 
     if timing {
+        eprintln!("phase2 dedup {:.1} ms, scatter {:.1} ms", (t_p2a - t_p1).as_secs_f64() * 1e3, (t_p2 - t_p2a).as_secs_f64() * 1e3);
         report(shr, &p1, &p3, threads, pp, cap, [t_setup, t_p1, t_p2, t_p3, t0.elapsed()]);
     }
     sys::exit_now(0);
