@@ -78,6 +78,25 @@ pub unsafe fn release(p: *mut u8, len: usize) {
     munmap(p as *mut c_void, len);
 }
 
+/// Faults in `[p, p + len)` for writing, one page at a time in the kernel,
+/// so later reads and writes take no page fault. Safe while other threads
+/// use the memory.
+pub unsafe fn populate_write(p: *mut u8, len: usize) {
+    const MADV_POPULATE_WRITE: i32 = 23;
+    if len == 0 {
+        return;
+    }
+    if madvise(p as *mut c_void, len, MADV_POPULATE_WRITE) != 0 {
+        // Older kernels: an atomic no-op write per page does the same.
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let mut at = 0;
+        while at < len {
+            (*(p.add(at) as *const AtomicU8)).fetch_or(0, Ordering::Relaxed);
+            at += PAGE;
+        }
+    }
+}
+
 impl Mapped {
     /// Unmaps the file's pages (the caller must not touch them afterwards).
     pub unsafe fn unmap(&self) {

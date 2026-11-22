@@ -163,6 +163,8 @@ struct Wc<T: Copy> {
     wc: *mut u8,
     heads: Vec<WcHead>,
     blocks: Vec<Blk>,
+    /// 4 KB blocks no longer in use elsewhere, taken before new memory.
+    spare: Vec<*mut u8>,
     _p: PhantomData<T>,
 }
 
@@ -180,6 +182,7 @@ impl<T: Copy> Wc<T> {
             wc: arena.alloc(parts * 64, 4096),
             heads: vec![WcHead { cur: std::ptr::null_mut(), cnt: 0, last: u32::MAX }; parts],
             blocks: Vec::with_capacity(4096),
+            spare: Vec::new(),
             _p: PhantomData,
         }
     }
@@ -195,7 +198,10 @@ impl<T: Copy> Wc<T> {
         h.cnt = c + 1;
         if idx == Self::PER_LINE - 1 {
             if (c / Self::PER_LINE) & 63 == 0 {
-                let b = arena.alloc(4096, 4096);
+                let b = match self.spare.pop() {
+                    Some(b) => b,
+                    None => arena.alloc(4096, 4096),
+                };
                 self.blocks.push(Blk { ptr: b, prev: h.last });
                 h.last = (self.blocks.len() - 1) as u32;
                 h.cur = b;
@@ -215,7 +221,10 @@ impl<T: Copy> Wc<T> {
             let rem = h.cnt & (Self::PER_LINE - 1);
             if rem != 0 {
                 if (h.cnt / Self::PER_LINE) & 63 == 0 {
-                    let b = arena.alloc(4096, 4096);
+                    let b = match self.spare.pop() {
+                    Some(b) => b,
+                    None => arena.alloc(4096, 4096),
+                };
                     self.blocks.push(Blk { ptr: b, prev: h.last });
                     h.last = (self.blocks.len() - 1) as u32;
                     h.cur = b;
@@ -317,10 +326,10 @@ impl Intern {
             bytes,
             shift: 64 - cap.trailing_zeros(),
             mask: cap - 1,
-            limit: (cap / 2) as u32,
-            id_ref: sys::anon_huge(cap / 2 * 8) as *mut u64,
-            penc: sys::anon_huge(cap / 2 * 4) as *mut u32,
-            name_enc: sys::anon_huge(cap / 2 * 4) as *mut u32,
+            limit: (cap / 8 * 5) as u32,
+            id_ref: sys::anon_huge(cap / 8 * 5 * 8) as *mut u64,
+            penc: sys::anon_huge(cap / 8 * 5 * 4) as *mut u32,
+            name_enc: sys::anon_huge(cap / 8 * 5 * 4) as *mut u32,
             next: AtomicU32::new(0),
             overflow: AtomicBool::new(false),
         }
@@ -339,6 +348,17 @@ impl Intern {
         sys::release(self.id_ref as *mut u8, self.limit as usize * 8);
         sys::release(self.penc as *mut u8, self.limit as usize * 4);
         sys::release(self.name_enc as *mut u8, self.limit as usize * 4);
+    }
+
+    /// Faults in thread `tid`'s share of the table. Lookups read a slot before
+    /// writing it; on untouched memory that is two page faults and a TLB
+    /// shootdown per page unless the pages are already there.
+    unsafe fn populate(&self, tid: usize, threads: usize) {
+        let page = 2usize << 20;
+        let per = (self.bytes / threads + page - 1) & !(page - 1);
+        let from = (tid * per).min(self.bytes);
+        let to = ((tid + 1) * per).min(self.bytes);
+        sys::populate_write((self.slots as *mut u8).add(from), to - from);
     }
 
     #[inline(always)]
@@ -872,7 +892,8 @@ unsafe fn link_people(sh: &Shared) {
     }
 }
 
-unsafe fn phase1(sh: &Shared, tid: usize) -> P1 {
+unsafe fn phase1(sh: &Shared, tid: usize, threads: usize) -> P1 {
+    sh.intern.populate(tid, threads);
     let pe = 1usize << sh.pe_bits;
     let mut arena = Arena::new();
     let fp = Wc::new(pe, &mut arena);
@@ -972,6 +993,7 @@ unsafe impl Sync for P2 {}
 unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
     let pe = 1usize << sh.pe_bits;
     let mut table: Vec<u64> = Vec::new();
+    let mut pending: Vec<(u32, u64)> = Vec::new();
     loop {
         let item = next.fetch_add(1, Ordering::Relaxed);
         if item >= pe {
@@ -989,6 +1011,7 @@ unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
         }
         let mask = tsize - 1;
         let tab = table.as_mut_ptr();
+        pending.clear();
         for t in p1 {
             t.fp.for_each(item, |q| {
                 let fp = *q;
@@ -1001,31 +1024,58 @@ unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
                         break;
                     }
                     if s >> 32 == tag {
-                        let a = row_ptr(p1, s as u32);
-                        let b = row_ptr(p1, fp as u32);
-                        if (*a).h2 == (*b).h2 {
-                            // Same event_id: the smaller ingest_ts stays.
-                            if (*b).ing < (*a).ing {
-                                (*a).tsv = 0;
-                                *tab.add(i) = fp;
-                            } else {
-                                (*b).tsv = 0;
-                            }
-                            break;
-                        }
+                        // Probably a copy of the same event. The rows are far away:
+                        // ask for them now and settle it after the partition.
+                        prefetch(row_ptr(p1, s as u32) as *const u8);
+                        prefetch(row_ptr(p1, fp as u32) as *const u8);
+                        pending.push((i as u32, fp));
+                        break;
                     }
                     i = (i + 1) & mask;
                 }
             });
         }
+        for &(at, fp) in pending.iter() {
+            let tag = fp >> 32;
+            let mut i = at as usize;
+            loop {
+                let s = *tab.add(i);
+                if s == 0 {
+                    *tab.add(i) = fp;
+                    break;
+                }
+                if s >> 32 == tag {
+                    let a = row_ptr(p1, s as u32);
+                    let b = row_ptr(p1, fp as u32);
+                    if (*a).h2 == (*b).h2 {
+                        // Same event_id: the smaller ingest_ts stays.
+                        if (*b).ing < (*a).ing {
+                            (*a).tsv = 0;
+                            *tab.add(i) = fp;
+                        } else {
+                            (*b).tsv = 0;
+                        }
+                        break;
+                    }
+                }
+                i = (i + 1) & mask;
+            }
+        }
     }
 }
 
+#[inline(always)]
+unsafe fn prefetch(p: *const u8) {
+    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
+}
+
 /// Phase 2b: scatter the surviving events (and purchases) by person.
-unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &AtomicUsize) -> P2 {
+unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &AtomicUsize, tid: usize) -> P2 {
     let mut arena = Arena::new();
-    let ev = Wc::new(sh.np, &mut arena);
+    let mut ev: Wc<PEv> = Wc::new(sh.np, &mut arena);
     let pu = Wc::new(sh.np, &mut arena);
+    // The fingerprint blocks of phase 1 are finished with: write the person records into them.
+    ev.spare = p1[tid].fp.blocks.iter().map(|b| b.ptr).collect();
     let mut out = P2 { arena, ev, pu };
     loop {
         let item = next.fetch_add(1, Ordering::Relaxed);
@@ -1682,7 +1732,7 @@ fn main() {
 
     // About 1 distinct user ID per 1,200 input bytes in generated data; the
     // table gets four or more times that, and is rebuilt larger if it fills.
-    let mut cap = ((bytes[KIND_EVENTS as usize] + bytes[KIND_CLICKS as usize]) / 300 + bytes[KIND_LINKS as usize] / 16)
+    let mut cap = ((bytes[KIND_EVENTS as usize] + bytes[KIND_CLICKS as usize]) / 700 + bytes[KIND_LINKS as usize] / 64)
         .next_power_of_two()
         .max(1 << 18);
     if let Some(v) = std::env::var("PIPE_CAP_BITS").ok().and_then(|v| v.parse::<u32>().ok()) {
@@ -1714,7 +1764,7 @@ fn main() {
         links_ready: AtomicBool::new(n_link_chunks == 0),
         intern: unsafe { Intern::new(cap) },
         pe_bits,
-        np: (cap / 2) >> PSHIFT,
+        np: (cap / 8 * 5) >> PSHIFT,
     };
 
     // Phase 1, repeated with a larger ID table in the unlikely case it fills.
@@ -1722,7 +1772,7 @@ fn main() {
     loop {
         let shr = &sh;
         p1 = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..threads).map(|tid| s.spawn(move || unsafe { phase1(shr, tid) })).collect();
+            let hs: Vec<_> = (0..threads).map(|tid| s.spawn(move || unsafe { phase1(shr, tid, threads) })).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         if !sh.intern.overflow.load(Ordering::Relaxed) {
@@ -1736,7 +1786,7 @@ fn main() {
             sh.intern.free();
             sh.intern = Intern::new(cap);
         }
-        sh.np = (cap / 2) >> PSHIFT;
+        sh.np = (cap / 8 * 5) >> PSHIFT;
         sh.next_chunk.store(0, Ordering::Relaxed);
         sh.links_done.store(0, Ordering::Relaxed);
         sh.links_ready.store(sh.n_link_chunks == 0, Ordering::Relaxed);
@@ -1765,7 +1815,10 @@ fn main() {
     let next = AtomicUsize::new(0);
     let unitsr = &units;
     let p2: Vec<P2> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..pp.threads).map(|_| s.spawn(|| unsafe { phase2_scatter(shr, p1r, unitsr, &next) })).collect();
+        let nextr = &next;
+        let hs: Vec<_> = (0..pp.threads)
+            .map(|tid| s.spawn(move || unsafe { phase2_scatter(shr, p1r, unitsr, nextr, tid) }))
+            .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let t_p2 = t0.elapsed();
