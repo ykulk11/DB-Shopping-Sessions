@@ -2920,6 +2920,23 @@ fn main() {
         eprintln!("phase2 dedup {:.1} ms, scatter {:.1} ms", (t_p2a - t_p1).as_secs_f64() * 1e3, (t_p2 - t_p2a).as_secs_f64() * 1e3);
         report(shr, &p1, &p3, threads, pp, cap, [t_setup, t_p1, t_p2, t_p3, t0.elapsed()]);
     }
+    // EXPERIMENT (not for merging): run the whole program once more as a
+    // child process that writes to the scratch directory. This build's time
+    // minus the time of the same commit without this is one whole run of the
+    // program inside the container; the rest is spent around it.
+    if std::env::var("PIPE_SECOND").is_err() {
+        if let Ok(s) = std::env::var("SCRATCH_DIR") {
+            let out2 = PathBuf::from(s).join("second");
+            let _ = std::process::Command::new("/proc/self/exe")
+                .arg(&data_dir)
+                .arg(&out2)
+                .env("PIPE_SECOND", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
     sys::exit_now(0);
 }
 
