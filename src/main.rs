@@ -672,11 +672,15 @@ impl LineIter {
         // Flags of the separator before each field, and of the one after it.
         let a = (sf.add(k) as *const u64).read_unaligned();
         let b = (sf.add(k + 1) as *const u64).read_unaligned();
-        let fields = (1u64 << (8 * N)) - 1;
-        // The first newline is the Nth separator, and no field has a bad quote.
-        let shape = (b & (ONES * (scan::F_NL | scan::F_BAD) as u64) & fields) ^ (1u64 << (8 * (N - 1)));
+        // One flag bit per field of the line; lanes N..8 of `fs`/`fe` are
+        // left unspecified.
+        let m = ONES & ((1u64 << (8 * N)) - 1);
+        // The first newline is the Nth separator, and no field has a bad
+        // quote: the flags of separator N - 1 rotated into byte 0 are exactly
+        // F_NL and every other byte is zero (an 8-bit constant, no register).
+        let shape = (b & (m * (scan::F_NL | scan::F_BAD) as u64)).rotate_right(8 * (N as u32 - 1)) ^ scan::F_NL as u64;
         // A field opens with a quote exactly when it closes with one.
-        let pairs = ((a >> 1) ^ (b >> 2)) & ONES & fields;
+        let pairs = ((a >> 1) ^ (b >> 2)) & m;
         if (shape | pairs) != 0 {
             let mut j = k + 1;
             while *sf.add(j) & scan::F_NL == 0 {
@@ -689,8 +693,8 @@ impl LineIter {
         let seps = sb.seps.as_ptr();
         let before = _mm256_loadu_si256(seps.add(k) as *const __m256i);
         let after = _mm256_loadu_si256(seps.add(k + 1) as *const __m256i);
-        let qa = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(((a >> 1) & ONES) as i64));
-        let qb = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(((b >> 2) & ONES) as i64));
+        let qa = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(((a >> 1) & m) as i64));
+        let qb = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(((b >> 2) & m) as i64));
         let start = _mm256_add_epi32(_mm256_sub_epi32(before, _mm256_set1_epi32(-1)), qa);
         _mm256_storeu_si256(fs.as_mut_ptr() as *mut __m256i, start);
         _mm256_storeu_si256(fe.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(after, qb));
@@ -855,28 +859,31 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         let l1 = (fe[1] - fs[1]) as usize;
         let (t, ing) = ts::parse_event_times(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize, text.add(fs[3] as usize), (fe[3] - fs[3]) as usize, &mut cx.dc);
         let ty = event_type(text.add(fs[4] as usize), (fe[4] - fs[4]) as usize);
-        // Fields 1 (user) and 5 (product) must not be empty.
-        let mut valid = (empty & 0b10_0010 == 0)
-            & ((t.wrapping_sub(wlo) as u64) < wspan)
-            & (ty != 0)
-            & (ing != BAD)
-            & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY_MS);
-        if valid && ty == 2 {
-            valid = purchase(sh, &mut cx.pur, text, &fs, &fe, first + (rref - rbase) as u32);
-        }
         // Seconds from the base. 0 and MAX - 1 stand for "further away than
         // fits" (never the case for a timestamp near the window); the exact
         // value of such a row is kept on the side for dedup.
         // BAD minus any base (ws / 1000 - 2^31) is far outside 1..=MAX-2, so
-        // the range test comes first and BAD is sorted out on the rare path.
+        // the range test comes first and BAD is sorted out on the rare path,
+        // which is also where `ing != BAD` is checked for validity.
         let d = ing.wrapping_sub(ing_base);
+        let mut ing_ok = true;
         let ing_key = if (d.wrapping_sub(1) as u64) < u32::MAX as u64 - 2 {
             d as u32
         } else if ing == BAD {
+            ing_ok = false;
             u32::MAX
         } else {
             far_ing(&mut cx.far, first + (rref - rbase) as u32, ing, d)
         };
+        // Fields 1 (user) and 5 (product) must not be empty.
+        let mut valid = (empty & 0b10_0010 == 0)
+            & ((t.wrapping_sub(wlo) as u64) < wspan)
+            & (ty != 0)
+            & ing_ok
+            & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY_MS);
+        if valid && ty == 2 {
+            valid = purchase(sh, &mut cx.pur, text, &fs, &fe, first + (rref - rbase) as u32);
+        }
         let tsv = if valid { (t - ws) as u32 | VALID } else { 0 };
         *rp = Row { uidx: u32::MAX, tsv, ing: ing_key, h2: h2 as u32 };
         // Hash bits 8..40 as the tag, the row reference below.

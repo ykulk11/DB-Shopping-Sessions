@@ -151,25 +151,26 @@ unsafe fn datetime19o(p: *const u8, dc: &mut DateCache) -> Option<i64> {
 
 /// `HH:MM:SS` (8 bytes) as seconds since midnight, or `None` unless every
 /// digit is an ASCII digit, both colons are present, and the values are in
-/// range. One check covers digits, separators and ranges; one multiply sums.
+/// range. The low half of `tod_pair`: one 64-bit lane validates and converts.
 #[inline(always)]
 unsafe fn time_of_day(p: *const u8) -> Option<i64> {
-    // Digits become their values, the colons zero, anything else fails the check.
-    let x = (p as *const u64).read_unaligned() ^ 0x3030_3a30_303a_3030;
-    // With every byte 0..=9 each byte of y is at most 99 and there are no carries:
-    // byte 0 = hours, byte 3 = minutes, byte 6 = seconds.
-    let y = x.wrapping_mul(10).wrapping_add(x >> 8);
-    let z = y & 0x00ff_0000_ff00_00ff;
-    // Adding 127 - limit to a value of at most 99 sets bit 7 exactly when the value
-    // exceeds the limit (23, 59, 59), without carrying out of the byte.
-    let bad = (x.wrapping_add(0x7676_7f76_767f_7676) | x | z.wrapping_add(0x0044_0000_4400_0068)) & 0x8080_8080_8080_8080;
-    if bad != 0 {
+    let v = _mm_loadl_epi64(p as *const __m128i);
+    // Digits become their values, the colons zero; anything else exceeds the limit.
+    // The upper half stays zero, so it passes every check and adds nothing.
+    let t = _mm_xor_si128(v, _mm_set_epi64x(0, 0x3030_3a30_303a_3030));
+    let over = _mm_subs_epu8(t, _mm_set1_epi64x(0x0909_0009_0900_0909));
+    let dg = _mm_shuffle_epi8(t, _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    // 16-bit lanes: hour, minute, second, then zeros.
+    let x = _mm_maddubs_epi16(dg, _mm_set1_epi16(0x010a));
+    let range = _mm_cmpgt_epi16(x, _mm_setr_epi16(23, 59, 59, 0, 0, 0, 0, 0));
+    let bad = _mm_or_si128(over, range);
+    if _mm_testz_si128(bad, bad) == 0 {
         return None;
     }
-    // z * (1 + 60 << 24 + 3600 << 48): bits 48..65 hold h * 3600 + m * 60 + s;
-    // the lower partial sums stay below bit 36 and the higher ones start at bit 72.
-    let m: u128 = 1 | (60 << 24) | (3600 << 48);
-    Some((((z as u128 * m) >> 48) as u64 & 0x3_ffff) as i64)
+    // 32-bit lanes: h * 3600 + m * 60, s; then their sum.
+    let s = _mm_madd_epi16(x, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+    let s = _mm_add_epi32(s, _mm_srli_epi64::<32>(s));
+    Some(_mm_cvtsi128_si32(s) as i64)
 }
 
 /// `HH:MM` (5 bytes, hours 0..=23, minutes 0..=59) as seconds, or `None`.
@@ -197,20 +198,26 @@ pub unsafe fn parse_f1_seconds(p: *const u8, len: usize, dc: &mut DateCache) -> 
     datetime19c(p, dc)
 }
 
-const ZEROS: u64 = 0x3030_3030_3030_3030;
-
-/// Whether all eight bytes of `x` (already XORed with `ZEROS`) are 0..=9.
+/// Thirteen ASCII digits as a number, or `None` unless all thirteen are digits.
+/// Reads 16 bytes; the 3 after the field are ignored. One 128-bit pass: the
+/// digits go to lanes 3..16 behind three zeros, then pairs, quads and octets.
 #[inline(always)]
-fn digits8(x: u64) -> bool {
-    (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 == 0
-}
-
-/// Eight digit values (first digit in the low byte) as a number.
-#[inline(always)]
-fn swar8(x: u64) -> u64 {
-    let x = (x.wrapping_mul(10).wrapping_add(x >> 8)) & 0x00ff_00ff_00ff_00ff;
-    let x = (x.wrapping_mul(100).wrapping_add(x >> 16)) & 0x0000_ffff_0000_ffff;
-    (x.wrapping_mul(10_000).wrapping_add(x >> 32)) & 0xffff_ffff
+unsafe fn digits13(p: *const u8) -> Option<i64> {
+    let t = _mm_sub_epi8(_mm_loadu_si128(p as *const __m128i), _mm_set1_epi8(b'0' as i8));
+    let d = _mm_shuffle_epi8(t, _mm_setr_epi8(-1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12));
+    // A digit is 0..=9 after the subtraction; anything else (wrapped or not) exceeds 9.
+    let over = _mm_subs_epu8(d, _mm_set1_epi8(9));
+    if _mm_testz_si128(over, over) == 0 {
+        return None;
+    }
+    // 16-bit lanes: two digits each; 32-bit lanes: four digits each.
+    let x = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010a));
+    let x = _mm_madd_epi16(x, _mm_set1_epi32(0x0001_0064));
+    // Four 4-digit values (at most 9999) as 16-bit lanes, then two 8-digit values.
+    let x = _mm_packus_epi32(x, x);
+    let x = _mm_madd_epi16(x, _mm_set1_epi32(0x0001_2710));
+    let v = _mm_cvtsi128_si64(x) as u64;
+    Some(((v & 0xffff_ffff) * 100_000_000 + (v >> 32)) as i64)
 }
 
 /// Any of the three forms, as milliseconds since the epoch, or `BAD`. A
@@ -226,12 +233,10 @@ pub unsafe fn parse_ts(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
         }
     } else if len == 13 {
         // The usual F3: thirteen digits.
-        let a = (p as *const u64).read_unaligned() ^ ZEROS;
-        let b = (p.add(5) as *const u64).read_unaligned() ^ ZEROS;
-        if digits8(a) && digits8(b) {
-            return (swar8(a) * 100_000 + swar8(b & 0xffff_ffff_ff00_0000)) as i64;
-        }
-        return BAD;
+        return match digits13(p) {
+            Some(t) => t,
+            None => BAD,
+        };
     } else if len == 25 {
         let sign = *p.add(19);
         // '+' (0x2b) or '-' (0x2d) in one test.
@@ -318,6 +323,14 @@ pub unsafe fn parse_event_times(tp: *const u8, tl: usize, ip: *const u8, il: usi
                     if let Some(bi) = date_base_after(ip, tp, bt, dc) {
                         return ((bt + tt) * 1000, bi + ti);
                     }
+                }
+            }
+        }
+    } else if tl == 13 {
+        if ing_shape {
+            if let Some(tt) = digits13(tp) {
+                if let Some(ti) = datetime19o(ip, dc) {
+                    return (tt, ti);
                 }
             }
         }
@@ -657,7 +670,11 @@ mod tests {
             if round % 4 == 0 {
                 s[(next() % 13) as usize] = b"0123456789 .-+e/:"[(next() % 17) as usize];
             }
-            let buf = padded(&s);
+            // The bytes after the field are digits or anything else; they must not matter.
+            let mut buf = padded(&s);
+            for k in 0..3 {
+                buf[32 + 13 + k] = if next() % 2 == 0 { b'0' + (next() % 10) as u8 } else { next() as u8 };
+            }
             let got = unsafe { parse_ts(buf.as_ptr().add(32), 13, &mut dc) };
             let want = match std::str::from_utf8(&s).ok().filter(|t| t.bytes().all(|c| c.is_ascii_digit())) {
                 Some(t) => t.parse::<i64>().unwrap(),
