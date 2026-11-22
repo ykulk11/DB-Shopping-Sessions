@@ -2075,3 +2075,117 @@ fn report(sh: &Shared, p1: &[P1], p3: &[P3], threads: usize, pp: Params, cap: us
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CSV dialect by the book: the bounds of the `n` fields of one line
+    /// (without its newline), quotes stripped, or `None` when it is malformed.
+    fn split_reference(line: &[u8], n: usize) -> Option<Vec<(usize, usize)>> {
+        let mut fields = Vec::new();
+        let mut start = 0;
+        for i in 0..=line.len() {
+            if i == line.len() || line[i] == b',' {
+                fields.push((start, i));
+                start = i + 1;
+            }
+        }
+        if fields.len() != n {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (s, e) in fields {
+            let f = &line[s..e];
+            let quotes = f.iter().filter(|&&c| c == b'"').count();
+            if quotes == 0 {
+                out.push((s, e));
+            } else if quotes == 2 && f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+                out.push((s + 1, e - 1));
+            } else {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    /// Random blocks over a small alphabet: the scan and the splitter must
+    /// agree with the reference on every line, for every field count in use,
+    /// whatever bytes follow the block.
+    #[test]
+    fn splitter_matches_reference() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut sb = scan::ScanBuf::new();
+        let mut checked = 0u64;
+        for round in 0..400_000u32 {
+            // Per block: how common each kind of byte is.
+            let w_sep = 1 + next() % 40;
+            let w_quote = next() % 30;
+            let w_nl = 1 + next() % 12;
+            let w_other = 1 + next() % 80;
+            let total = w_sep + w_quote + w_nl + w_other;
+            let len = if round % 64 == 0 { 2000 + (next() % 9000) as usize } else { (next() % 420) as usize };
+            let lead = (next() % 67) as usize;
+            let mut buf = vec![b'x'; lead + len + 1 + 200];
+            for b in buf.iter_mut() {
+                let r = next() % total;
+                *b = if r < w_sep {
+                    b','
+                } else if r < w_sep + w_quote {
+                    b'"'
+                } else if r < w_sep + w_quote + w_nl {
+                    b'\n'
+                } else if r % 7 == 0 {
+                    b'\r'
+                } else {
+                    b'a'
+                };
+            }
+            buf[lead + len] = b'\n';
+            let text = &buf[lead..lead + len + 1];
+            unsafe { scan::scan(text.as_ptr(), text.len(), &mut sb) };
+            let line_count = text.iter().filter(|&&c| c == b'\n').count();
+            assert_eq!(sb.lines, line_count, "line count, round {round}");
+            for n in [2usize, 4, 7] {
+                let mut it = LineIter::new();
+                let mut fs = [0u32; 8];
+                let mut fe = [0u32; 8];
+                let mut line_start = 0usize;
+                for (i, &c) in text.iter().enumerate() {
+                    if c != b'\n' {
+                        continue;
+                    }
+                    let line = &text[line_start..i];
+                    assert!(it.line < sb.lines);
+                    let ok = match n {
+                        2 => unsafe { it.next::<2>(&sb, &mut fs, &mut fe) },
+                        4 => unsafe { it.next::<4>(&sb, &mut fs, &mut fe) },
+                        _ => unsafe { it.next::<7>(&sb, &mut fs, &mut fe) },
+                    };
+                    let want = split_reference(line, n);
+                    assert_eq!(ok, want.is_some(), "round {round} n {n} line {:?}", String::from_utf8_lossy(line));
+                    if let Some(want) = want {
+                        for j in 0..n {
+                            assert_eq!(
+                                (fs[j] as usize, fe[j] as usize),
+                                (line_start + want[j].0, line_start + want[j].1),
+                                "round {round} n {n} field {j} line {:?}",
+                                String::from_utf8_lossy(line)
+                            );
+                        }
+                        checked += 1;
+                    }
+                    line_start = i + 1;
+                }
+                assert_eq!(it.line, sb.lines);
+            }
+        }
+        assert!(checked > 100_000, "too few well-formed lines were checked: {checked}");
+    }
+}
