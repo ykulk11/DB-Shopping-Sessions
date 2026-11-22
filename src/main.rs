@@ -576,19 +576,43 @@ impl Intern {
     }
 }
 
+/// While people are joined, a root that has members holds this mark in
+/// `penc` instead of 0. Joining always makes the smaller number the root, so
+/// a person's root is its smallest number and every parent is smaller than
+/// its child.
+const ROOT_MARK: u32 = 0x8000_0000;
+
+/// The root of `x` while people are joined, halving the path on the way.
 #[inline(always)]
 unsafe fn uf_find(penc: *mut u32, mut x: u32) -> u32 {
     loop {
         let e = *penc.add(x as usize);
-        if e == 0 {
+        if e == 0 || e == ROOT_MARK {
             return x;
         }
         let p = e - 1;
         let ge = *penc.add(p as usize);
-        if ge != 0 {
+        if ge != 0 && ge != ROOT_MARK {
             *penc.add(x as usize) = ge;
         }
         x = p;
+    }
+}
+
+/// The first 8 bytes of an interned ID, big-endian, zero past its end. Two
+/// IDs whose keys differ compare like their bytes (a zero pad sorts a proper
+/// prefix first); equal keys need the bytes themselves. Reading 8 bytes is
+/// safe: the field is followed by more of its line or the zero page after
+/// the file.
+#[inline(always)]
+unsafe fn id_key(r: u64) -> u64 {
+    let p = (r & 0x0000_ffff_ffff_ffff) as *const u8;
+    let len = (r >> 48) as usize;
+    let k = u64::from_be_bytes((p as *const [u8; 8]).read_unaligned());
+    if len >= 8 {
+        k
+    } else {
+        k & !(u64::MAX >> (len * 8))
     }
 }
 
@@ -1152,47 +1176,66 @@ unsafe fn link_people(sh: &Shared) {
     let penc = sh.intern.penc;
     let name_enc = sh.intern.name_enc;
     let id_ref = sh.intern.id_ref;
+    // Every number a link line produced is below this.
+    let n = sh.intern.next.load(Ordering::Acquire).min(sh.intern.limit) as usize;
     use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
     // Pairs come in random ID order, so every lookup is a likely cache miss
     // at full size: request the entries of the pair PF ahead.
     const PF: usize = 8;
-    #[inline(always)]
-    unsafe fn pf_pair(penc: *mut u32, list: &[(u32, u32)], i: usize) {
-        if let Some(&(a, b)) = list.get(i + PF) {
-            _mm_prefetch::<_MM_HINT_T0>(penc.add(a as usize) as *const i8);
-            _mm_prefetch::<_MM_HINT_T0>(penc.add(b as usize) as *const i8);
-        }
-    }
     for list in lists.iter() {
         for (i, &(a, b)) in list.iter().enumerate() {
-            pf_pair(penc, list, i);
+            if let Some(&(a2, b2)) = list.get(i + PF) {
+                _mm_prefetch::<_MM_HINT_T0>(penc.add(a2 as usize) as *const i8);
+                _mm_prefetch::<_MM_HINT_T0>(penc.add(b2 as usize) as *const i8);
+            }
             let ra = uf_find(penc, a);
             let rb = uf_find(penc, b);
             if ra != rb {
-                *penc.add(rb as usize) = ra + 1;
+                let (lo, hi) = (ra.min(rb), ra.max(rb));
+                *penc.add(hi as usize) = lo + 1;
+                *penc.add(lo as usize) = ROOT_MARK;
             }
         }
     }
-    // Every union is done, so roots no longer change: name each person by its
-    // smallest ID and point each linked ID straight at its root in one pass.
-    for list in lists.iter() {
-        for (i, &(a, b)) in list.iter().enumerate() {
-            pf_pair(penc, list, i);
-            for x in [a, b] {
-                let r = uf_find(penc, x);
-                if r != x {
-                    *penc.add(x as usize) = r + 1;
-                }
-                let cur = *name_enc.add(r as usize);
-                let cur_id = if cur == 0 { r } else { cur - 1 };
-                if x != cur_id
-                    && id_bytes(*id_ref.add(x as usize)) < id_bytes(*id_ref.add(cur_id as usize))
-                {
-                    *name_enc.add(r as usize) = x + 1;
-                }
-            }
+    // Name each person by its smallest ID and point every member straight at
+    // its root, in one pass over the numbers in order. A root comes before its
+    // members and a parent before its child, so the parent of `x` already
+    // points at the root (or is it). Numbers were handed out in reading
+    // order, so the ID bytes are read nearly in order too. `keys` holds the
+    // key of each root's current name.
+    let kbytes = n * 8 + 64;
+    let keys = sys::anon_huge(kbytes) as *mut u64;
+    for x in 0..n {
+        let e = *penc.add(x);
+        if e == 0 {
+            continue;
+        }
+        let kx = id_key(*id_ref.add(x));
+        if e == ROOT_MARK {
+            *penc.add(x) = 0;
+            *keys.add(x) = kx;
+            continue;
+        }
+        let p = (e - 1) as usize;
+        let pe = *penc.add(p);
+        let r = if pe == 0 { p } else { (pe - 1) as usize };
+        *penc.add(x) = r as u32 + 1;
+        let kr = *keys.add(r);
+        if kx < kr || (kx == kr && name_tie(id_ref, name_enc, r, x)) {
+            *keys.add(r) = kx;
+            *name_enc.add(r) = x as u32 + 1;
         }
     }
+    sys::release(keys as *mut u8, kbytes);
+}
+
+/// Whether ID `x` sorts before the current name of root `r` (their keys are equal).
+#[cold]
+#[inline(never)]
+unsafe fn name_tie(id_ref: *mut u64, name_enc: *mut u32, r: usize, x: usize) -> bool {
+    let cur = *name_enc.add(r);
+    let cur_id = if cur == 0 { r } else { cur as usize - 1 };
+    id_bytes(*id_ref.add(x)) < id_bytes(*id_ref.add(cur_id))
 }
 
 unsafe fn phase1(sh: &Shared, tid: usize, threads: usize) -> P1 {
@@ -1722,6 +1765,25 @@ unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &At
     // The fingerprint blocks of phase 1 are finished with: write the person records into them.
     ev.spare = p1[tid].fp.blocks.iter().map(|b| b.ptr).collect();
     let mut out = P2 { arena, ev, pu };
+    // `Intern::person` on a copy of the table pointer: the compiler cannot
+    // tell that the Wc stores leave `sh` alone, so it would reload it per row.
+    let penc = sh.intern.penc as *const u32;
+    #[inline(always)]
+    unsafe fn person_of(penc: *const u32, uidx: u32) -> u32 {
+        let e = *penc.add(uidx as usize);
+        if e == 0 {
+            uidx
+        } else {
+            e - 1
+        }
+    }
+    #[inline(always)]
+    unsafe fn event(out: &mut P2, penc: *const u32, r: Row) {
+        if r.tsv & VALID != 0 {
+            let person = person_of(penc, r.uidx);
+            out.ev.push(&mut out.arena, (person >> PSHIFT) as usize, PEv { person, ts: r.tsv & !VALID });
+        }
+    }
     loop {
         let item = next.fetch_add(1, Ordering::Relaxed);
         if item >= units.len() {
@@ -1734,61 +1796,57 @@ unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &At
         let first = c << ROW_BITS;
         let pur = &src.pur;
         let mut pcur = pur.partition_point(|x| x.0 < first);
-        // `pur` holds strictly increasing row numbers, so the rows run in
-        // stretches without a purchase, each closed by one purchase row.
-        // Rows below `pf_end` have a row 16 ahead whose person to prefetch.
-        let pf_end = used.saturating_sub(16);
-        let mut i = 0usize;
-        loop {
-            let stop = if pcur < pur.len() {
-                ((pur.get_unchecked(pcur).0 - first) as usize).min(used)
+        let end = base.add(used);
+        // The row of purchase `pcur`; the end of the chunk when the purchase
+        // is in a later chunk or there is none.
+        let pur_row = |pcur: usize| {
+            if pcur < pur.len() {
+                base.add(((pur.get_unchecked(pcur).0 - first) as usize).min(used))
             } else {
-                used
+                end
+            }
+        };
+        let mut np = pur_row(pcur);
+        // A purchase row was scattered as an event with the others; this adds
+        // its purchase record for every purchase row before `upto`.
+        macro_rules! purchases_before {
+            ($upto:expr) => {
+                while np < $upto {
+                    let r = *np;
+                    if r.tsv & VALID != 0 {
+                        let person = person_of(penc, r.uidx);
+                        let pc = pur.get_unchecked(pcur).1;
+                        out.pu.push(&mut out.arena, (person >> PSHIFT) as usize, PPu { person, ts: r.tsv & !VALID, pc, pad: 0 });
+                    }
+                    pcur += 1;
+                    np = pur_row(pcur);
+                }
             };
-            let mid = stop.min(pf_end).max(i);
-            while i < mid {
-                sh.intern.prefetch_person((*base.add(i + 16)).uidx);
-                if i % 4 == 0 {
-                    // One page ahead in the row store.
-                    prefetch(base.add(i + 256) as *const u8);
-                }
-                let r = *base.add(i);
-                if r.tsv & VALID != 0 {
-                    let person = sh.intern.person(r.uidx);
-                    out.ev.push(&mut out.arena, (person >> PSHIFT) as usize, PEv { person, ts: r.tsv & !VALID });
-                }
-                i += 1;
-            }
-            while i < stop {
-                // The last 16 rows: nothing ahead to prefetch.
-                let r = *base.add(i);
-                if r.tsv & VALID != 0 {
-                    let person = sh.intern.person(r.uidx);
-                    out.ev.push(&mut out.arena, (person >> PSHIFT) as usize, PEv { person, ts: r.tsv & !VALID });
-                }
-                i += 1;
-            }
-            if i >= used {
-                break;
-            }
-            // Row i is a purchase.
-            if i < pf_end {
-                sh.intern.prefetch_person((*base.add(i + 16)).uidx);
-            }
-            if i % 4 == 0 {
-                prefetch(base.add(i + 256) as *const u8);
-            }
-            let r = *base.add(i);
-            if r.tsv & VALID != 0 {
-                let person = sh.intern.person(r.uidx);
-                let part = (person >> PSHIFT) as usize;
-                let ts = r.tsv & !VALID;
-                out.ev.push(&mut out.arena, part, PEv { person, ts });
-                out.pu.push(&mut out.arena, part, PPu { person, ts, pc: pur.get_unchecked(pcur).1, pad: 0 });
-            }
-            pcur += 1;
-            i += 1;
         }
+        let mut p = base;
+        // Four rows (one line of the row store) at a time while the four rows
+        // 16 ahead exist, so no row needs a test for when to prefetch.
+        let stop = base.add(used.saturating_sub(19));
+        while p < stop {
+            // One page ahead in the row store.
+            prefetch(p.wrapping_add(256) as *const u8);
+            for k in 0..4 {
+                prefetch(penc.wrapping_add((*p.add(16 + k)).uidx as usize) as *const u8);
+            }
+            // Written out: the compiler keeps a loop over a body this big.
+            event(&mut out, penc, *p);
+            event(&mut out, penc, *p.add(1));
+            event(&mut out, penc, *p.add(2));
+            event(&mut out, penc, *p.add(3));
+            p = p.add(4);
+            purchases_before!(p);
+        }
+        // The last rows: nothing ahead to prefetch.
+        while p < end {
+            event(&mut out, penc, *p);
+            p = p.add(1);
+        }
+        purchases_before!(end);
         // Nothing reads this chunk again (dedup is finished and each chunk is
         // scattered once): return its pages, so that phase 3's allocations reuse
         // them instead of fresh memory, which is costly on some VMs.
@@ -1860,12 +1918,20 @@ unsafe fn phase3(
     let mut cpos = vec![0u32; l + 1];
     let mut tsbuf: Vec<u32> = Vec::new();
     let mut cbuf: Vec<ClS> = Vec::new();
-    let mut pus: Vec<(u64, u32)> = Vec::new();
+    // Purchases grouped by person with a counting sort (then each person's by
+    // time), as (`li << 32 | ts`, price and category) with li the person's
+    // index in the partition, so the next person's keys are all larger.
+    let mut pcnt = vec![0u32; l + 1];
+    let mut pbuf: Vec<(u64, u32)> = Vec::new();
     let ncamp = sh.camp_names.len();
     let ndays = sh.ndays;
     let ncat = sh.cat_names.len();
     let cells = (ncamp + 1) * ndays;
     let mut agg = Agg { hot: vec![[0u32; 2]; cells], cold: vec![(0u64, 0u32); cells] };
+    // Where sessions without a purchase add their zeros (opaque, so that the
+    // update below stays one unconditional store).
+    let mut cold_spare = (0u64, 0u32);
+    let spare: *mut (u64, u32) = std::hint::black_box(&mut cold_spare);
     let mut wcnt = vec![0u32; ncamp + 1];
     let mut wpos = vec![0u32; ncamp + 1];
     // Per campaign: fstamp << 5 | the earliest click index seen so far, for
@@ -1890,7 +1956,7 @@ unsafe fn phase3(
     let mut radix_tmp: Vec<u32> = Vec::new();
     let mut cls_tmp: Vec<ClS> = Vec::new();
     // Bit g set when event g of the partition comes more than GAP_MS after
-    // event g - 1 (meaningful within a person only), plus a bit at the end.
+    // event g - 1, written by each person over its own events (see below).
     let mut brk: Vec<u64> = Vec::new();
     let mut out = UserCols {
         rows: 0,
@@ -1914,7 +1980,8 @@ unsafe fn phase3(
     out.cat.reserve(est * 8);
     out.cat_valid.reserve(est / 8);
     let week = WEEK_MS as u64;
-    let mut names = vec![0u64; l];
+    // The people of a partition that have events, padded for the look-ahead.
+    let mut plist = vec![0u32; l + 32];
     let mut tm = [0.0f64; 4];
     loop {
         let k = next.fetch_add(1, Ordering::Relaxed);
@@ -1936,10 +2003,18 @@ unsafe fn phase3(
                 *cnt.get_unchecked_mut(((*r).person - base) as usize + 1) += 1;
             });
         }
+        // Prefix sums, and the people with events in order.
         let mut acc = 0u32;
-        for c in cnt.iter_mut() {
-            acc += *c;
-            *c = acc;
+        let mut np = 0usize;
+        {
+            let pl = plist.as_mut_ptr();
+            for i in 0..l {
+                let c = *cnt.get_unchecked(i + 1);
+                *pl.add(np) = i as u32;
+                np += (c != 0) as usize;
+                acc += c;
+                *cnt.get_unchecked_mut(i + 1) = acc;
+            }
         }
         pos.copy_from_slice(&cnt);
         tsbuf.clear();
@@ -1956,15 +2031,35 @@ unsafe fn phase3(
             });
         }
 
-        pus.clear();
+        let n_pu: usize = p2.iter().map(|t| t.pu.count(q)).sum();
+        pcnt.fill(0);
         for t in p2 {
             t.pu.for_each(q, |r| {
-                pus.push(((((*r).person - base) as u64) << 32 | (*r).ts as u64, (*r).pc));
+                *pcnt.get_unchecked_mut(((*r).person - base) as usize + 1) += 1;
             });
         }
-        if pus.len() > 1 {
-            pus.sort_unstable_by_key(|x| x.0);
+        let mut acc = 0u32;
+        for c in pcnt.iter_mut() {
+            let t = *c;
+            *c = acc;
+            acc += t;
         }
+        // pcnt[i + 1] is now where person i's purchases start; the scatter
+        // advances it to where they end, which is where person i + 1's start.
+        pbuf.clear();
+        // An end mark after the last run: the purchase loop stops at a key
+        // past the person's own.
+        pbuf.reserve(n_pu + 1);
+        pbuf.set_len(n_pu + 1);
+        for t in p2 {
+            t.pu.for_each(q, |r| {
+                let li = ((*r).person - base) as usize;
+                let at = *pcnt.get_unchecked(li + 1);
+                *pbuf.get_unchecked_mut(at as usize) = ((li as u64) << 32 | (*r).ts as u64, (*r).pc);
+                *pcnt.get_unchecked_mut(li + 1) = at + 1;
+            });
+        }
+        *pbuf.get_unchecked_mut(n_pu) = (u64::MAX, 0);
 
         let n_cl: usize = p1.iter().map(|t| t.cl.count(q)).sum();
         if n_cl > 0 {
@@ -1995,81 +2090,127 @@ unsafe fn phase3(
         }
 
         let t_b = Instant::now();
-        // Sort every person's events and clicks by time, and find their names.
-        for i in 0..l {
-            let a = cnt[i] as usize;
-            let b = cnt[i + 1] as usize;
-            if a == b {
-                continue;
-            }
-            let evs = &mut tsbuf[a..b];
-            if evs.len() > 1 {
-                sort_times(evs, &mut radix_tmp);
-            }
-            if n_cl > 0 {
-                let cls = &mut cbuf[ccnt[i] as usize..ccnt[i + 1] as usize];
-                if cls.len() > 1 {
-                    sort_clicks(cls, &mut cls_tmp);
-                }
-            }
-            let root = base + i as u32;
-            let ne = *sh.intern.name_enc.add(root as usize);
-            let r = *sh.intern.id_ref.add(if ne == 0 { root } else { ne - 1 } as usize);
-            names[i] = r;
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                (r & 0x0000_ffff_ffff_ffff) as *const i8,
-            );
+        // Room for a category per purchase, so rows are written without
+        // checks (each batch below makes room for its rows).
+        out.cat.reserve(n_pu * 32 + 32);
+        // Break bits, one byte per eight events, written by each batch over
+        // its own events before they are read (see below).
+        if brk.len() < (n_ev >> 6) + 2 {
+            brk.resize((n_ev >> 6) + 2, 0);
         }
+        let bw = brk.as_mut_ptr();
+        let bb = bw as *mut u8;
         let t_c = Instant::now();
 
-        // Session breaks for the whole partition, eight events at a time.
-        let nw = (n_ev >> 6) + 1;
-        brk.clear();
-        brk.reserve(nw);
-        {
-            use std::arch::x86_64::*;
-            let tp = tsbuf.as_ptr();
-            let gap = _mm256_set1_epi32(GAP_MS as i32);
-            let bp = brk.as_mut_ptr();
-            for w in 0..nw {
-                let mut word = 0u64;
-                for q in 0..8 {
-                    let at = (w << 6) + (q << 3);
-                    let cur = _mm256_loadu_si256(tp.add(at) as *const __m256i);
-                    let before = if at == 0 {
-                        _mm256_permutevar8x32_epi32(cur, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6))
-                    } else {
-                        _mm256_loadu_si256(tp.add(at - 1) as *const __m256i)
-                    };
-                    // Within a person the difference is below 2^31.
-                    let big = _mm256_cmpgt_epi32(_mm256_sub_epi32(cur, before), gap);
-                    word |= (_mm256_movemask_ps(_mm256_castsi256_ps(big)) as u32 as u64) << (q << 3);
-                }
-                *bp.add(w) = word;
-            }
-            brk.set_len(nw);
-            *brk.get_unchecked_mut(n_ev >> 6) |= 1u64 << (n_ev & 63);
+        // People go in batches: sort their events and clicks, mark the session
+        // breaks over the batch, then build their sessions while all of it is
+        // in cache. A person's name is the ID name_enc points to, or its own:
+        // the line of its reference is requested a batch ahead, the reference
+        // read while the batch sorts, and the name's bytes requested then.
+        const PB: usize = 16;
+        let last = *plist.get_unchecked(np - 1);
+        for x in plist[np..np + PB].iter_mut() {
+            *x = last;
         }
-
-        // Room for a row per session (at most one per break bit and person),
-        // and a category per purchase, so rows are written without checks.
-        let max_rows = brk.iter().map(|w| w.count_ones() as usize).sum::<usize>() + l;
-        out.day.reserve(max_rows * 4);
-        out.sessions.reserve(max_rows * 4);
-        out.events.reserve(max_rows * 4);
-        out.revenue.reserve(max_rows * 8);
-        out.cat.reserve(pus.len() * 32 + 32);
-        out.cat_valid.reserve(max_rows / 8 + 2);
-        let mut pcur = 0usize;
-        for i in 0..l {
-            let a = cnt[i] as usize;
-            let b = cnt[i + 1] as usize;
-            if a == b {
-                continue;
+        let name_id = |p: u32| -> u32 {
+            let root = base + p;
+            let ne = *sh.intern.name_enc.add(root as usize);
+            if ne == 0 {
+                root
+            } else {
+                ne - 1
             }
-            let cls: &[ClS] = if n_cl > 0 { &cbuf[ccnt[i] as usize..ccnt[i + 1] as usize] } else { &[] };
-            let name = id_bytes(names[i]);
+        };
+        // The batch's name IDs, then (once it has sorted) the next batch's.
+        let mut nids = [0u32; PB];
+        for x in 0..PB {
+            nids[x] = name_id(*plist.get_unchecked(x));
+            prefetch(sh.intern.id_ref.add(nids[x] as usize) as *const u8);
+        }
+        let mut names = [0u64; PB];
+        for pj in 0..np {
+            if pj % PB == 0 {
+                let pj1 = (pj + PB).min(np);
+                for x in pj..pj1 {
+                    let i = *plist.get_unchecked(x) as usize;
+                    let r = *sh.intern.id_ref.add(*nids.get_unchecked(x % PB) as usize);
+                    *names.get_unchecked_mut(x % PB) = r;
+                    prefetch((r & 0x0000_ffff_ffff_ffff) as *const u8);
+                    let a = *cnt.get_unchecked(i) as usize;
+                    let b = *cnt.get_unchecked(i + 1) as usize;
+                    if b - a > 1 {
+                        sort_times(tsbuf.get_unchecked_mut(a..b), &mut radix_tmp);
+                    }
+                    if n_cl > 0 {
+                        let c = cbuf
+                            .get_unchecked_mut(*ccnt.get_unchecked(i) as usize..*ccnt.get_unchecked(i + 1) as usize);
+                        if c.len() > 1 {
+                            sort_clicks(c, &mut cls_tmp);
+                        }
+                    }
+                    let (pa, pe) = (*pcnt.get_unchecked(i) as usize, *pcnt.get_unchecked(i + 1) as usize);
+                    if pe - pa > 1 {
+                        pbuf.get_unchecked_mut(pa..pe).sort_unstable_by_key(|x| x.0);
+                    }
+                }
+                // Break bytes over the batch's events ba + 1 ..= be - 1 (the 64
+                // zeros after the partition's events cover the loads past its
+                // end), then a bit at be. A bit at or past a person's end means
+                // nothing: the scan below stops at the person's end.
+                let ba = *cnt.get_unchecked(*plist.get_unchecked(pj) as usize) as usize;
+                let be = *cnt.get_unchecked(*plist.get_unchecked(pj1 - 1) as usize + 1) as usize;
+                use std::arch::x86_64::*;
+                let tp = tsbuf.as_ptr();
+                let gap = _mm256_set1_epi32(GAP_MS as i32);
+                // Within a person the difference is below 2^31.
+                let mark = |cur: __m256i, before: __m256i| {
+                    _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_sub_epi32(cur, before), gap))) as u8
+                };
+                let mut s = (ba + 1) >> 3;
+                // Set bits, counted for a bound on the batch's sessions.
+                let mut ones = 0u32;
+                if s == 0 {
+                    let cur = _mm256_loadu_si256(tp as *const __m256i);
+                    let m = mark(cur, _mm256_permutevar8x32_epi32(cur, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6)));
+                    *bb = m;
+                    ones += m.count_ones();
+                    s = 1;
+                }
+                while s <= (be - 1) >> 3 {
+                    let at = s << 3;
+                    let m = mark(
+                        _mm256_loadu_si256(tp.add(at) as *const __m256i),
+                        _mm256_loadu_si256(tp.add(at - 1) as *const __m256i),
+                    );
+                    *bb.add(s) = m;
+                    ones += m.count_ones();
+                    s += 1;
+                }
+                *bb.add(be >> 3) |= 1u8 << (be & 7);
+                // Room for the batch's rows: at most one per session, and each
+                // person's sessions after the first start at a set bit.
+                let rows = ones as usize + (pj1 - pj);
+                out.day.reserve(rows * 4);
+                out.sessions.reserve(rows * 4);
+                out.events.reserve(rows * 4);
+                out.revenue.reserve(rows * 8);
+                out.cat_valid.reserve(rows / 8 + 2);
+            }
+            // The next batch's name: its ID, and its reference's line.
+            let nid = name_id(*plist.get_unchecked(pj + PB));
+            *nids.get_unchecked_mut(pj % PB) = nid;
+            prefetch(sh.intern.id_ref.add(nid as usize) as *const u8);
+            let i = *plist.get_unchecked(pj) as usize;
+            let name = id_bytes(*names.get_unchecked(pj % PB));
+            let a = *cnt.get_unchecked(i) as usize;
+            let b = *cnt.get_unchecked(i + 1) as usize;
+            let cls: &[ClS] = if n_cl > 0 {
+                cbuf.get_unchecked(*ccnt.get_unchecked(i) as usize..*ccnt.get_unchecked(i + 1) as usize)
+            } else {
+                &[]
+            };
             out.uid.reserve((b - a).min(ndays) * (4 + name.len()));
+            let mut pcur = *pcnt.get_unchecked(i) as usize;
             let pkey = (i as u64) << 32;
 
             // Up to 32 clicks: the window is found with two vector compares per
@@ -2122,11 +2263,11 @@ unsafe fn phase3(
                 let start = *tsbuf.get_unchecked(k);
                 let s1 = k + 1;
                 let mut w = s1 >> 6;
-                let mut bits = *brk.get_unchecked(w) & (!0u64 << (s1 & 63));
+                let mut bits = *bw.add(w) & (!0u64 << (s1 & 63));
                 while bits == 0 {
-                    // Ends at the latest on the bit at n_ev >= b.
+                    // Ends at the latest on the bit at the batch's end.
                     w += 1;
-                    bits = *brk.get_unchecked(w);
+                    bits = *bw.add(w);
                 }
                 let j = ((w << 6) + bits.trailing_zeros() as usize).min(b);
                 let prev = *tsbuf.get_unchecked(j - 1);
@@ -2150,8 +2291,8 @@ unsafe fn phase3(
                 let mut has = false;
                 let last_key = pkey | prev as u64;
                 let row_tag = out.rows as u64 + 1;
-                while pcur < pus.len() && pus[pcur].0 <= last_key {
-                    let pc = pus[pcur].1;
+                while pbuf.get_unchecked(pcur).0 <= last_key {
+                    let pc = pbuf.get_unchecked(pcur).1;
                     let price = (pc & 0x00ff_ffff) as u64;
                     rev += price;
                     // Sums only grow, so the top category (the first maximum in
@@ -2255,11 +2396,11 @@ unsafe fn phase3(
                     }
                 }
                 agg.hot.get_unchecked_mut(cell)[0] += 1;
-                if has {
-                    let c = agg.cold.get_unchecked_mut(cell);
-                    c.0 += rev;
-                    c.1 += 1;
-                }
+                // Only a session with a purchase touches its cold cell; the
+                // others add zeros to a spare one, without a branch.
+                let c = if has { agg.cold.as_mut_ptr().add(cell) } else { spare };
+                (*c).0 += rev;
+                (*c).1 += has as u32;
             }
             emit_row(sh, &mut out, name, cur_day, d_sessions, d_events, d_rev, d_has, d_cat, &catrec);
             for &c in active.iter() {
@@ -2283,8 +2424,9 @@ unsafe fn phase3(
 }
 
 /// The click a session is credited to among the window `cls[lo..hi]`: the
-/// latest; on a tie the byte-wise smallest click_id.
-#[inline]
+/// latest; on a tie the byte-wise smallest click_id. Rare, and out of line so
+/// the session loop keeps its registers.
+#[inline(never)]
 unsafe fn tie_best(cls: &[ClS], lo: usize, hi: usize) -> usize {
     let mut best = hi - 1;
     let top = cls[best].ts;
