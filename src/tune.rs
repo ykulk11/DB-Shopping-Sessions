@@ -13,4 +13,4 @@ pub const BLOCK_KB: usize = 32;
 pub const HUGE: bool = true;
 
 /// Worker threads = usable CPUs divided by this (PIPE_THREADS sets the number).
-pub const THREAD_DIVISOR: usize = 1;
+pub const THREAD_DIVISOR: usize = 2;
