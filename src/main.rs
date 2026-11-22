@@ -1482,9 +1482,27 @@ unsafe fn phase3(
     let mut agg = Agg { hot: vec![[0u32; 2]; cells], cold: vec![(0u64, 0u32); cells] };
     let mut wcnt = vec![0u32; ncamp + 1];
     let mut wpos = vec![0u32; ncamp + 1];
+    // Per campaign: fstamp << 5 | the earliest click index seen so far, for
+    // the person whose number is fstamp (so no reset between people).
+    let mut flast = vec![0u32; ncamp + 1];
+    let mut fstamp = 0u32;
     let mut active: Vec<u32> = Vec::with_capacity(ncamp + 1);
-    let mut catsum = vec![0u64; ncat];
+    // Per category: [revenue in the row being built, that row's number + 1].
+    let mut catsum = vec![[0u64; 2]; ncat];
+    // Every category as a 32-byte record (length, name, padding) when all
+    // fit, so a row writes its top category without a branch.
+    let catrec: Vec<u8> = if sh.cat_names.iter().all(|c| c.len() <= 28) {
+        let mut v = vec![0u8; ncat * 32];
+        for (i, c) in sh.cat_names.iter().enumerate() {
+            v[i * 32..i * 32 + 4].copy_from_slice(&(c.len() as u32).to_le_bytes());
+            v[i * 32 + 4..i * 32 + 4 + c.len()].copy_from_slice(c);
+        }
+        v
+    } else {
+        Vec::new()
+    };
     let mut radix_tmp: Vec<u32> = Vec::new();
+    let mut cls_tmp: Vec<ClS> = Vec::new();
     // Bit g set when event g of the partition comes more than GAP_MS after
     // event g - 1 (meaningful within a person only), plus a bit at the end.
     let mut brk: Vec<u64> = Vec::new();
@@ -1498,6 +1516,17 @@ unsafe fn phase3(
         cat: Vec::new(),
         cat_valid: Vec::new(),
     };
+    // About one row per 10 events (one per person and day): start the columns
+    // a little above this thread's share, so they rarely grow by copying.
+    let total_ev: usize = (0..pp.np_used).map(|q| p2.iter().map(|t| t.ev.count(q)).sum::<usize>()).sum();
+    let est = total_ev / pp.threads / 8;
+    out.uid.reserve(est * 20);
+    out.day.reserve(est * 4);
+    out.sessions.reserve(est * 4);
+    out.events.reserve(est * 4);
+    out.revenue.reserve(est * 8);
+    out.cat.reserve(est * 8);
+    out.cat_valid.reserve(est / 8);
     let week = WEEK_MS as u64;
     let mut names = vec![0u64; l];
     let mut tm = [0.0f64; 4];
@@ -1593,7 +1622,7 @@ unsafe fn phase3(
             if n_cl > 0 {
                 let cls = &mut cbuf[ccnt[i] as usize..ccnt[i + 1] as usize];
                 if cls.len() > 1 {
-                    cls.sort_unstable_by_key(|c| c.ts);
+                    sort_clicks(cls, &mut cls_tmp);
                 }
             }
             let root = base + i as u32;
@@ -1635,6 +1664,15 @@ unsafe fn phase3(
             *brk.get_unchecked_mut(n_ev >> 6) |= 1u64 << (n_ev & 63);
         }
 
+        // Room for a row per session (at most one per break bit and person),
+        // and a category per purchase, so rows are written without checks.
+        let max_rows = brk.iter().map(|w| w.count_ones() as usize).sum::<usize>() + l;
+        out.day.reserve(max_rows * 4);
+        out.sessions.reserve(max_rows * 4);
+        out.events.reserve(max_rows * 4);
+        out.revenue.reserve(max_rows * 8);
+        out.cat.reserve(pus.len() * 32 + 32);
+        out.cat_valid.reserve(max_rows / 8 + 2);
         let mut pcur = 0usize;
         for i in 0..l {
             let a = cnt[i] as usize;
@@ -1644,13 +1682,50 @@ unsafe fn phase3(
             }
             let cls: &[ClS] = if n_cl > 0 { &cbuf[ccnt[i] as usize..ccnt[i + 1] as usize] } else { &[] };
             let name = id_bytes(names[i]);
+            out.uid.reserve((b - a).min(ndays) * (4 + name.len()));
             let pkey = (i as u64) << 32;
 
-            let mut cur_day = usize::MAX;
+            // Up to 32 clicks: the window is found with two vector compares per
+            // session instead of a sliding window. fnx[x] is the index of the
+            // next click of the same campaign (32 if none), so a click is the
+            // last of its campaign in the window [lo, hi) when fnx[x] >= hi.
+            use std::arch::x86_64::*;
+            let fast = cls.len() <= 32;
+            let mut fts = [_mm256_set1_epi32(i32::MAX); 4];
+            let mut fnx = [_mm256_setzero_si256(); 4];
+            // Entry 32 is a cell that empty slots of the unrolled assist loop add 0 to.
+            let mut fcell = [0u32; 33];
+            if fast && !cls.is_empty() {
+                fstamp += 1;
+                if fstamp == 1 << 27 {
+                    flast.fill(0);
+                    fstamp = 1;
+                }
+                let mut tsa = [i32::MAX; 32];
+                let mut nxa = [0i32; 32];
+                for x in (0..cls.len()).rev() {
+                    let c = cls.get_unchecked(x).camp as usize;
+                    let last = *flast.get_unchecked(c);
+                    *flast.get_unchecked_mut(c) = fstamp << 5 | x as u32;
+                    nxa[x] = if last >> 5 == fstamp { (last & 31) as i32 } else { 32 };
+                    tsa[x] = (cls.get_unchecked(x).ts ^ 0x8000_0000) as i32;
+                    fcell[x] = (c * ndays) as u32;
+                }
+                for v in 0..4 {
+                    fts[v] = _mm256_loadu_si256(tsa.as_ptr().add(v * 8) as *const __m256i);
+                    fnx[v] = _mm256_loadu_si256(nxa.as_ptr().add(v * 8) as *const __m256i);
+                }
+            }
+
+            // The first session's day, so a change of day always ends a row.
+            let mut cur_day = ((sh.ws_mod_day + *tsbuf.get_unchecked(a) as u64) / DAY_MS as u64) as usize;
             let mut d_sessions = 0u32;
             let mut d_events = 0u32;
             let mut d_rev = 0u64;
             let mut d_has = false;
+            // The day's top category so far and its revenue.
+            let mut d_cat = 0u32;
+            let mut d_cat_sum = 0u64;
             let mut lo = 0usize;
             let mut hi = 0usize;
 
@@ -1673,25 +1748,34 @@ unsafe fn phase3(
 
                 let d = ((sh.ws_mod_day + start as u64) / DAY_MS as u64) as usize;
                 if d != cur_day {
-                    if d_sessions > 0 {
-                        emit_row(sh, &mut out, name, cur_day, d_sessions, d_events, d_rev, d_has, &mut catsum);
-                    }
+                    emit_row(sh, &mut out, name, cur_day, d_sessions, d_events, d_rev, d_has, d_cat, &catrec);
                     cur_day = d;
                     d_sessions = 0;
                     d_events = 0;
                     d_rev = 0;
                     d_has = false;
+                    d_cat = 0;
+                    d_cat_sum = 0;
                 }
 
                 // Purchases in the session: those of this person up to its last event.
                 let mut rev = 0u64;
                 let mut has = false;
                 let last_key = pkey | prev as u64;
+                let row_tag = out.rows as u64 + 1;
                 while pcur < pus.len() && pus[pcur].0 <= last_key {
                     let pc = pus[pcur].1;
                     let price = (pc & 0x00ff_ffff) as u64;
                     rev += price;
-                    *catsum.get_unchecked_mut((pc >> 24) as usize) += price;
+                    // Sums only grow, so the top category (the first maximum in
+                    // byte order, category 0 at 0) can be kept as they do.
+                    let c = pc >> 24;
+                    let e = catsum.get_unchecked_mut(c as usize);
+                    let sum = if e[1] == row_tag { e[0] } else { 0 } + price;
+                    *e = [sum, row_tag];
+                    let better = (sum > d_cat_sum) | ((sum == d_cat_sum) & (c < d_cat));
+                    d_cat = if better { c } else { d_cat };
+                    d_cat_sum = if better { sum } else { d_cat_sum };
                     has = true;
                     pcur += 1;
                 }
@@ -1704,6 +1788,52 @@ unsafe fn phase3(
                 let cell;
                 if cls.is_empty() {
                     cell = ncamp * ndays + d;
+                } else if fast {
+                    let mm = |v: __m256i| _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32;
+                    let sv = _mm256_set1_epi32((start ^ 0x8000_0000) as i32);
+                    let ev = _mm256_set1_epi32((start.wrapping_add(WEEK_MS as u32) ^ 0x8000_0000) as i32);
+                    // Too old (sorted, so a prefix) and too new (a suffix, padding included).
+                    let mut old = 0u32;
+                    let mut new = 0u32;
+                    for v in 0..4 {
+                        old |= mm(_mm256_cmpgt_epi32(sv, fts[v])) << (v * 8);
+                        new |= mm(_mm256_cmpgt_epi32(fts[v], ev)) << (v * 8);
+                    }
+                    let flo = old.count_ones() as usize;
+                    let fhi = 32 - new.count_ones() as usize;
+                    if fhi > flo {
+                        let hv = _mm256_set1_epi32(fhi as i32 - 1);
+                        let mut lastm = 0u32;
+                        for v in 0..4 {
+                            lastm |= mm(_mm256_cmpgt_epi32(fnx[v], hv)) << (v * 8);
+                        }
+                        let mut m = lastm & !old & !new;
+                        let mut best = fhi - 1;
+                        // A tie for the latest time: another click in the window at it.
+                        let tv = _mm256_set1_epi32((cls.get_unchecked(best).ts ^ 0x8000_0000) as i32);
+                        let mut same = 0u32;
+                        for v in 0..4 {
+                            same |= mm(_mm256_cmpeq_epi32(fts[v], tv)) << (v * 8);
+                        }
+                        if (same & !old).count_ones() > 1 {
+                            best = tie_best(cls, flo, fhi);
+                        }
+                        cell = *fcell.get_unchecked(best) as usize + d;
+                        // Four campaigns without branches (an empty mask finds slot 32),
+                        // which covers most sessions; then the rest.
+                        for _ in 0..4 {
+                            let x = m.trailing_zeros() as usize;
+                            agg.hot.get_unchecked_mut(*fcell.get_unchecked(x) as usize + d)[1] += (m != 0) as u32;
+                            m &= m.wrapping_sub(1);
+                        }
+                        while m != 0 {
+                            let x = m.trailing_zeros() as usize;
+                            agg.hot.get_unchecked_mut(*fcell.get_unchecked(x) as usize + d)[1] += 1;
+                            m &= m - 1;
+                        }
+                    } else {
+                        cell = ncamp * ndays + d;
+                    }
                 } else {
                     let s = start as u64;
                     while hi < cls.len() && cls[hi].ts as u64 <= s + week {
@@ -1728,21 +1858,7 @@ unsafe fn phase3(
                         lo += 1;
                     }
                     if hi > lo {
-                        // Latest click; on a tie the byte-wise smallest click_id.
-                        let mut best = hi - 1;
-                        let top = cls[best].ts;
-                        let mut x = hi - 1;
-                        while x > lo && cls[x - 1].ts == top {
-                            x -= 1;
-                            if cls[x].camp != cls[best].camp && click_id(&cls[x]) < click_id(&cls[best]) {
-                                best = x;
-                            } else if cls[x].camp == cls[best].camp {
-                                // Same campaign either way; keep the smaller ID for later comparisons.
-                                if click_id(&cls[x]) < click_id(&cls[best]) {
-                                    best = x;
-                                }
-                            }
-                        }
+                        let best = tie_best(cls, lo, hi);
                         cell = cls[best].camp as usize * ndays + d;
                         for &c in active.iter() {
                             agg.hot.get_unchecked_mut(c as usize * ndays + d)[1] += 1;
@@ -1758,9 +1874,7 @@ unsafe fn phase3(
                     c.1 += 1;
                 }
             }
-            if d_sessions > 0 {
-                emit_row(sh, &mut out, name, cur_day, d_sessions, d_events, d_rev, d_has, &mut catsum);
-            }
+            emit_row(sh, &mut out, name, cur_day, d_sessions, d_events, d_rev, d_has, d_cat, &catrec);
             for &c in active.iter() {
                 wcnt[c as usize] = 0;
             }
@@ -1781,8 +1895,25 @@ unsafe fn phase3(
     P3 { rows: out.rows, agg, tm }
 }
 
-/// Sorts event times: a three-pass radix sort for large groups (whales and
-/// shared devices), the standard sort for the rest.
+/// The click a session is credited to among the window `cls[lo..hi]`: the
+/// latest; on a tie the byte-wise smallest click_id.
+#[inline]
+unsafe fn tie_best(cls: &[ClS], lo: usize, hi: usize) -> usize {
+    let mut best = hi - 1;
+    let top = cls[best].ts;
+    let mut x = hi - 1;
+    while x > lo && cls[x - 1].ts == top {
+        x -= 1;
+        if click_id(&cls[x]) < click_id(&cls[best]) {
+            best = x;
+        }
+    }
+    best
+}
+
+/// Sorts event times: branchless small sorts up to 64, a three-pass radix
+/// sort for large groups (whales and shared devices), the standard sort for
+/// the rest.
 #[inline(always)]
 fn sort_times(v: &mut [u32], tmp: &mut Vec<u32>) {
     if v.len() <= 16 {
@@ -1790,11 +1921,391 @@ fn sort_times(v: &mut [u32], tmp: &mut Vec<u32>) {
         unsafe { rank_sort16(v) };
         return;
     }
-    if v.len() < 2048 {
-        v.sort_unstable();
+    if v.len() <= 32 {
+        // SAFETY: 17..=32 values, each below 2^31.
+        unsafe { net_sort32(v) };
+        return;
+    }
+    if v.len() <= 64 {
+        // SAFETY: 33..=64 values, each below 2^31.
+        unsafe { net_sort64(v) };
+        return;
+    }
+    if v.len() < MERGE_MAX {
+        // SAFETY: 65..MERGE_MAX values, each below 2^31.
+        unsafe { net_merge_sort(v, tmp) };
         return;
     }
     radix_sort(v, tmp);
+}
+
+const MERGE_MAX: usize = 2048;
+
+/// Sorts a person's clicks by time. Order among equal times does not
+/// matter: attribution scans all of them for the smallest click_id.
+#[inline(always)]
+fn sort_clicks(v: &mut [ClS], tmp: &mut Vec<ClS>) {
+    if v.len() == 2 {
+        let (x, y) = (v[0], v[1]);
+        let swap = y.ts < x.ts;
+        v[0] = if swap { y } else { x };
+        v[1] = if swap { x } else { y };
+        return;
+    }
+    if v.len() <= 16 {
+        // SAFETY: 3..=16 clicks.
+        unsafe { rank_sort_cls16(v) };
+        return;
+    }
+    if v.len() >= 512 {
+        radix_cls(v, tmp);
+        return;
+    }
+    v.sort_unstable_by_key(|c| c.ts);
+}
+
+/// LSD radix sort of clicks on the full 32-bit ts: four passes of 8 bits,
+/// so each scatter writes at most 256 streams.
+#[inline(never)]
+fn radix_cls(v: &mut [ClS], tmp: &mut Vec<ClS>) {
+    let n = v.len();
+    if tmp.len() < n {
+        tmp.resize(n, ClS { ts: 0, camp: 0, idref: 0 });
+    }
+    let tmp = &mut tmp[..n];
+    let mut c = [[0u32; 256]; 4];
+    for x in v.iter() {
+        for d in 0..4 {
+            c[d][((x.ts >> (d * 8)) & 255) as usize] += 1;
+        }
+    }
+    for h in c.iter_mut() {
+        let mut acc = 0u32;
+        for e in h.iter_mut() {
+            let t = *e;
+            *e = acc;
+            acc += t;
+        }
+    }
+    for d in 0..4 {
+        let (src, dst): (&[ClS], &mut [ClS]) = if d & 1 == 0 { (&*v, &mut *tmp) } else { (&*tmp, &mut *v) };
+        let h = &mut c[d];
+        for x in src.iter() {
+            let b = ((x.ts >> (d * 8)) & 255) as usize;
+            dst[h[b] as usize] = *x;
+            h[b] += 1;
+        }
+    }
+}
+
+/// Branchless sort of 2..=16 clicks: the 64-bit keys `ts << 4 | index` are
+/// distinct, so each click's place is the number of keys below its own.
+#[inline(never)]
+unsafe fn rank_sort_cls16(v: &mut [ClS]) {
+    use std::arch::x86_64::*;
+    let n = v.len();
+    let p = v.as_mut_ptr();
+    let mut keys = [i64::MAX; 16];
+    let mut buf = std::mem::MaybeUninit::<[ClS; 16]>::uninit();
+    let bp = buf.as_mut_ptr() as *mut ClS;
+    for i in 0..n {
+        let c = *p.add(i);
+        keys[i] = (c.ts as i64) << 4 | i as i64;
+        bp.add(i).write(c);
+    }
+    let kp = keys.as_ptr() as *const __m256i;
+    let mut rk = [0i64; 16];
+    if n <= 4 {
+        let a0 = _mm256_loadu_si256(kp);
+        let mut r0 = _mm256_setzero_si256();
+        for j in 0..4 {
+            r0 = _mm256_sub_epi64(r0, _mm256_cmpgt_epi64(a0, _mm256_set1_epi64x(keys[j])));
+        }
+        _mm256_storeu_si256(rk.as_mut_ptr() as *mut __m256i, r0);
+    } else if n <= 8 {
+        let a0 = _mm256_loadu_si256(kp);
+        let a1 = _mm256_loadu_si256(kp.add(1));
+        let (mut r0, mut r1) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+        // Padding keys are i64::MAX and count for nobody.
+        for j in 0..8 {
+            let c = _mm256_set1_epi64x(keys[j]);
+            r0 = _mm256_sub_epi64(r0, _mm256_cmpgt_epi64(a0, c));
+            r1 = _mm256_sub_epi64(r1, _mm256_cmpgt_epi64(a1, c));
+        }
+        _mm256_storeu_si256(rk.as_mut_ptr() as *mut __m256i, r0);
+        _mm256_storeu_si256(rk.as_mut_ptr().add(4) as *mut __m256i, r1);
+    } else {
+        let a = [
+            _mm256_loadu_si256(kp),
+            _mm256_loadu_si256(kp.add(1)),
+            _mm256_loadu_si256(kp.add(2)),
+            _mm256_loadu_si256(kp.add(3)),
+        ];
+        let mut r = [_mm256_setzero_si256(); 4];
+        for j in 0..16 {
+            let c = _mm256_set1_epi64x(keys[j]);
+            for q in 0..4 {
+                r[q] = _mm256_sub_epi64(r[q], _mm256_cmpgt_epi64(a[q], c));
+            }
+        }
+        for q in 0..4 {
+            _mm256_storeu_si256(rk.as_mut_ptr().add(q << 2) as *mut __m256i, r[q]);
+        }
+    }
+    for i in 0..n {
+        *p.add(rk[i] as usize) = *bp.add(i);
+    }
+}
+
+/// Merges two sorted runs whose lengths are multiples of 8 into `out`,
+/// eight lanes at a time: the lower half of a bitonic merge leaves, the
+/// upper half stays, and the next block comes from the run whose head is
+/// smaller. Reads one value past each run's end (never used).
+#[inline(always)]
+unsafe fn merge_stream(pa: *const u32, la: usize, pb: *const u32, lb: usize, out: *mut u32) {
+    use std::arch::x86_64::*;
+    let rev = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    let mut x = _mm256_loadu_si256(pa as *const __m256i);
+    let mut y = _mm256_loadu_si256(pb as *const __m256i);
+    let (mut ia, mut ib) = (8usize, 8usize);
+    let mut o = out;
+    for _ in 2..(la + lb) >> 3 {
+        let yr = _mm256_permutevar8x32_epi32(y, rev);
+        _mm256_storeu_si256(o as *mut __m256i, bitonic8(_mm256_min_epi32(x, yr)));
+        x = bitonic8(_mm256_max_epi32(x, yr));
+        o = o.add(8);
+        let take_a = (ib >= lb) | ((ia < la) & (*pa.add(ia) <= *pb.add(ib)));
+        let from = if take_a { pa.add(ia) } else { pb.add(ib) };
+        y = _mm256_loadu_si256(from as *const __m256i);
+        ia += (take_a as usize) << 3;
+        ib += (!take_a as usize) << 3;
+    }
+    let yr = _mm256_permutevar8x32_epi32(y, rev);
+    _mm256_storeu_si256(o as *mut __m256i, bitonic8(_mm256_min_epi32(x, yr)));
+    _mm256_storeu_si256(o.add(8) as *mut __m256i, bitonic8(_mm256_max_epi32(x, yr)));
+}
+
+/// Sorts 65..MERGE_MAX values below 2^31: blocks of 64 by net_sort64 (the
+/// tail padded with i32::MAX), then bottom-up SIMD merges, in `tmp`.
+#[inline(never)]
+unsafe fn net_merge_sort(v: &mut [u32], tmp: &mut Vec<u32>) {
+    let n = v.len();
+    let m = (n + 63) & !63;
+    tmp.clear();
+    tmp.reserve(2 * m + 8);
+    let a = tmp.as_mut_ptr();
+    let b = a.add(m);
+    std::ptr::copy_nonoverlapping(v.as_ptr(), a, n);
+    for k in n..m + 8 {
+        *a.add(k) = i32::MAX as u32;
+    }
+    *b.add(m) = i32::MAX as u32;
+    *b.add(m + 7) = i32::MAX as u32;
+    for blk in (0..m).step_by(64) {
+        net_sort64(std::slice::from_raw_parts_mut(a.add(blk), 64));
+    }
+    let (mut src, mut dst) = (a, b);
+    let mut w = 64;
+    while w < m {
+        let mut s = 0;
+        while s < m {
+            let mid = (s + w).min(m);
+            let end = (s + 2 * w).min(m);
+            if mid == end {
+                std::ptr::copy_nonoverlapping(src.add(s), dst.add(s), end - s);
+            } else {
+                merge_stream(src.add(s), mid - s, src.add(mid), end - mid, dst.add(s));
+            }
+            s += 2 * w;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        w *= 2;
+    }
+    std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), n);
+}
+
+/// Compare-exchange of two registers: the smaller lanes to r[i].
+#[inline(always)]
+unsafe fn cx<const N: usize>(r: &mut [std::arch::x86_64::__m256i; N], i: usize, j: usize) {
+    use std::arch::x86_64::*;
+    let lo = _mm256_min_epi32(r[i], r[j]);
+    r[j] = _mm256_max_epi32(r[i], r[j]);
+    r[i] = lo;
+}
+
+/// Sorts a bitonic run of eight lanes inside one register.
+#[inline(always)]
+unsafe fn bitonic8(x: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let p = _mm256_permute2x128_si256::<1>(x, x);
+    let x = _mm256_blend_epi32::<0xF0>(_mm256_min_epi32(x, p), _mm256_max_epi32(x, p));
+    let p = _mm256_shuffle_epi32::<0x4E>(x);
+    let x = _mm256_blend_epi32::<0xCC>(_mm256_min_epi32(x, p), _mm256_max_epi32(x, p));
+    let p = _mm256_shuffle_epi32::<0xB1>(x);
+    _mm256_blend_epi32::<0xAA>(_mm256_min_epi32(x, p), _mm256_max_epi32(x, p))
+}
+
+/// Merges the sorted runs r[o..o + m] and r[o + m..o + 2m] (m registers each)
+/// into one sorted run: reverse the second, split, then bitonic halves.
+#[inline(always)]
+unsafe fn merge_runs<const N: usize>(r: &mut [std::arch::x86_64::__m256i; N], o: usize, m: usize) {
+    use std::arch::x86_64::*;
+    let rev = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    for i in 0..m {
+        r[o + m + i] = _mm256_permutevar8x32_epi32(r[o + m + i], rev);
+    }
+    for i in 0..m / 2 {
+        r.swap(o + m + i, o + 2 * m - 1 - i);
+    }
+    for i in 0..m {
+        cx(r, o + i, o + m + i);
+    }
+    // Both halves are bitonic now; finish each with half-cleaners.
+    let mut d = m / 2;
+    while d > 0 {
+        for h in [o, o + m] {
+            for i in 0..m {
+                if i & d == 0 {
+                    cx(r, h + i, h + i + d);
+                }
+            }
+        }
+        d /= 2;
+    }
+    for i in 0..2 * m {
+        r[o + i] = bitonic8(r[o + i]);
+    }
+}
+
+/// Branchless sort of 17..=64 values below 2^31 with a sorting network in
+/// eight registers, padded with i32::MAX: an 8-input network down the
+/// columns, a transpose, then bitonic merges of the runs (8, 16, 32 lanes).
+#[inline(never)]
+unsafe fn net_sort64(v: &mut [u32]) {
+    use std::arch::x86_64::*;
+    let n = v.len();
+    let p = v.as_mut_ptr();
+    let nn = _mm256_set1_epi32(n as i32);
+    let pad = _mm256_set1_epi32(i32::MAX);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut r = [pad; 8];
+    for k in 0..8 {
+        // Lanes past the end are masked off: never read, never faulting.
+        let mask = _mm256_cmpgt_epi32(nn, _mm256_add_epi32(lane, _mm256_set1_epi32((k << 3) as i32)));
+        let x = _mm256_maskload_epi32(p.wrapping_add(k << 3) as *const i32, mask);
+        r[k] = _mm256_blendv_epi8(pad, x, mask);
+    }
+    // Spelled out so that it unrolls: Knuth's 19-comparator network.
+    cx(&mut r, 0, 2);
+    cx(&mut r, 1, 3);
+    cx(&mut r, 4, 6);
+    cx(&mut r, 5, 7);
+    cx(&mut r, 0, 4);
+    cx(&mut r, 1, 5);
+    cx(&mut r, 2, 6);
+    cx(&mut r, 3, 7);
+    cx(&mut r, 0, 1);
+    cx(&mut r, 2, 3);
+    cx(&mut r, 4, 5);
+    cx(&mut r, 6, 7);
+    cx(&mut r, 2, 4);
+    cx(&mut r, 3, 5);
+    cx(&mut r, 1, 4);
+    cx(&mut r, 3, 6);
+    cx(&mut r, 1, 2);
+    cx(&mut r, 3, 4);
+    cx(&mut r, 5, 6);
+    // Transpose: register l becomes column l, a sorted run of eight.
+    let t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+    let t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+    let t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+    let t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+    let t4 = _mm256_unpacklo_epi32(r[4], r[5]);
+    let t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+    let t6 = _mm256_unpacklo_epi32(r[6], r[7]);
+    let t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+    let u0 = _mm256_unpacklo_epi64(t0, t2);
+    let u1 = _mm256_unpackhi_epi64(t0, t2);
+    let u2 = _mm256_unpacklo_epi64(t1, t3);
+    let u3 = _mm256_unpackhi_epi64(t1, t3);
+    let u4 = _mm256_unpacklo_epi64(t4, t6);
+    let u5 = _mm256_unpackhi_epi64(t4, t6);
+    let u6 = _mm256_unpacklo_epi64(t5, t7);
+    let u7 = _mm256_unpackhi_epi64(t5, t7);
+    r[0] = _mm256_permute2x128_si256::<0x20>(u0, u4);
+    r[1] = _mm256_permute2x128_si256::<0x20>(u1, u5);
+    r[2] = _mm256_permute2x128_si256::<0x20>(u2, u6);
+    r[3] = _mm256_permute2x128_si256::<0x20>(u3, u7);
+    r[4] = _mm256_permute2x128_si256::<0x31>(u0, u4);
+    r[5] = _mm256_permute2x128_si256::<0x31>(u1, u5);
+    r[6] = _mm256_permute2x128_si256::<0x31>(u2, u6);
+    r[7] = _mm256_permute2x128_si256::<0x31>(u3, u7);
+    for o in [0, 2, 4, 6] {
+        merge_runs(&mut r, o, 1);
+    }
+    merge_runs(&mut r, 0, 2);
+    merge_runs(&mut r, 4, 2);
+    merge_runs(&mut r, 0, 4);
+    for k in 0..8 {
+        let mask = _mm256_cmpgt_epi32(nn, _mm256_add_epi32(lane, _mm256_set1_epi32((k << 3) as i32)));
+        _mm256_maskstore_epi32(p.wrapping_add(k << 3) as *mut i32, mask, r[k]);
+    }
+}
+
+/// net_sort64 for 17..=32 values in four registers: a 4-input network down
+/// the columns, a transpose to sorted runs of four, then bitonic merges.
+#[inline(never)]
+unsafe fn net_sort32(v: &mut [u32]) {
+    use std::arch::x86_64::*;
+    let n = v.len();
+    let p = v.as_mut_ptr();
+    let nn = _mm256_set1_epi32(n as i32);
+    let pad = _mm256_set1_epi32(i32::MAX);
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut r = [pad; 4];
+    for k in 0..4 {
+        let mask = _mm256_cmpgt_epi32(nn, _mm256_add_epi32(lane, _mm256_set1_epi32((k << 3) as i32)));
+        let x = _mm256_maskload_epi32(p.wrapping_add(k << 3) as *const i32, mask);
+        r[k] = _mm256_blendv_epi8(pad, x, mask);
+    }
+    cx(&mut r, 0, 1);
+    cx(&mut r, 2, 3);
+    cx(&mut r, 0, 2);
+    cx(&mut r, 1, 3);
+    cx(&mut r, 1, 2);
+    // Each 128-bit half of u_l becomes one sorted column of four.
+    let t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+    let t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+    let t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+    let t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+    let u = [
+        _mm256_unpacklo_epi64(t0, t2),
+        _mm256_unpackhi_epi64(t0, t2),
+        _mm256_unpacklo_epi64(t1, t3),
+        _mm256_unpackhi_epi64(t1, t3),
+    ];
+    // Merge the runs of four in u0 with u1 and u2 with u3, half by half.
+    for h in [0, 2] {
+        let b = _mm256_shuffle_epi32::<0x1B>(u[h + 1]);
+        let lo = _mm256_min_epi32(u[h], b);
+        let hi = _mm256_max_epi32(u[h], b);
+        let mut m = [lo, hi];
+        for x in m.iter_mut() {
+            let q = _mm256_shuffle_epi32::<0x4E>(*x);
+            let y = _mm256_blend_epi32::<0xCC>(_mm256_min_epi32(*x, q), _mm256_max_epi32(*x, q));
+            let q = _mm256_shuffle_epi32::<0xB1>(y);
+            *x = _mm256_blend_epi32::<0xAA>(_mm256_min_epi32(y, q), _mm256_max_epi32(y, q));
+        }
+        r[h] = _mm256_permute2x128_si256::<0x20>(m[0], m[1]);
+        r[h + 1] = _mm256_permute2x128_si256::<0x31>(m[0], m[1]);
+    }
+    merge_runs(&mut r, 0, 1);
+    merge_runs(&mut r, 2, 1);
+    merge_runs(&mut r, 0, 2);
+    for k in 0..4 {
+        let mask = _mm256_cmpgt_epi32(nn, _mm256_add_epi32(lane, _mm256_set1_epi32((k << 3) as i32)));
+        _mm256_maskstore_epi32(p.wrapping_add(k << 3) as *mut i32, mask, r[k]);
+    }
 }
 
 /// -1 in the upper half: `TIE[15 - j + i]` is -1 exactly when lane i > j.
@@ -1894,8 +2405,18 @@ fn radix_sort(v: &mut [u32], tmp: &mut Vec<u32>) {
     v.copy_from_slice(tmp);
 }
 
+/// Appends `b` to a vector with room for it.
 #[inline(always)]
-fn emit_row(
+unsafe fn put<const N: usize>(v: &mut Vec<u8>, b: [u8; N]) {
+    let l = v.len();
+    std::ptr::write_unaligned(v.as_mut_ptr().add(l) as *mut [u8; N], b);
+    v.set_len(l + N);
+}
+
+/// Appends a row. The caller reserved room for it (`catrec` records are
+/// written whole, so `cat` has 32 bytes to spare).
+#[inline(always)]
+unsafe fn emit_row(
     sh: &Shared,
     out: &mut UserCols,
     name: &[u8],
@@ -1904,32 +2425,33 @@ fn emit_row(
     events: u32,
     revenue: u64,
     has: bool,
-    catsum: &mut [u64],
+    cat: u32,
+    catrec: &[u8],
 ) {
-    out.uid.extend_from_slice(&(name.len() as u32).to_le_bytes());
-    out.uid.extend_from_slice(name);
-    out.day.extend_from_slice(&(sh.day0 + day as i32).to_le_bytes());
-    out.sessions.extend_from_slice(&(sessions as i32).to_le_bytes());
-    out.events.extend_from_slice(&(events as i32).to_le_bytes());
-    out.revenue.extend_from_slice(&(revenue as i64).to_le_bytes());
+    put(&mut out.uid, (name.len() as u32).to_le_bytes());
+    let l = out.uid.len();
+    std::ptr::copy_nonoverlapping(name.as_ptr(), out.uid.as_mut_ptr().add(l), name.len());
+    out.uid.set_len(l + name.len());
+    put(&mut out.day, (sh.day0 + day as i32).to_le_bytes());
+    put(&mut out.sessions, (sessions as i32).to_le_bytes());
+    put(&mut out.events, (events as i32).to_le_bytes());
+    put(&mut out.revenue, (revenue as i64).to_le_bytes());
     if out.rows % 8 == 0 {
-        out.cat_valid.push(0);
+        put(&mut out.cat_valid, [0u8]);
     }
-    if has {
-        // Categories are numbered in byte order, so the first maximum wins ties.
-        let mut best = 0usize;
-        let mut best_sum = 0u64;
-        for (c, s) in catsum.iter_mut().enumerate() {
-            if *s > best_sum {
-                best_sum = *s;
-                best = c;
-            }
-            *s = 0;
-        }
-        let cat = &sh.cat_names[best];
-        out.cat.extend_from_slice(&(cat.len() as u32).to_le_bytes());
-        out.cat.extend_from_slice(cat);
-        *out.cat_valid.last_mut().unwrap() |= 1 << (out.rows % 8);
+    *out.cat_valid.last_mut().unwrap_unchecked() |= (has as u8) << (out.rows % 8);
+    let l = out.cat.len();
+    if !catrec.is_empty() {
+        // Written always, kept only with a purchase.
+        let rec = catrec.as_ptr().add(cat as usize * 32);
+        std::ptr::copy_nonoverlapping(rec, out.cat.as_mut_ptr().add(l), 32);
+        let len = 4 + *rec as usize;
+        out.cat.set_len(l + if has { len } else { 0 });
+    } else if has {
+        let c = &sh.cat_names[cat as usize];
+        out.cat.reserve(4 + c.len());
+        out.cat.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        out.cat.extend_from_slice(c);
     }
     out.rows += 1;
 }
@@ -2506,6 +3028,67 @@ mod tests {
             unsafe { rank_sort16(&mut padded[17..17 + n]) };
             assert_eq!(&padded[17..17 + n], &v[..], "round {round}");
             assert!(padded[..17].iter().chain(&padded[17 + n..]).all(|&x| x == 0xdead_beef), "round {round}");
+        }
+    }
+
+    /// The sorting networks behind sort_times must agree with the standard sort.
+    #[test]
+    fn sort_times_matches_std() {
+        let mut seed = 0x2468_ace0_1357_9bdfu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut tmp = Vec::new();
+        for round in 0..400_000u32 {
+            let n = if round % 16 == 5 { 65 + (next() % 2100) as usize } else { 17 + (next() % 48) as usize };
+            let range = match round % 4 {
+                0 => 4,
+                1 => 1000,
+                2 => 1u64 << 31,
+                _ => 1 + next() % (1u64 << 31),
+            };
+            let top = if round % 8 == 2 { (1u64 << 31) - range } else { 0 };
+            let mut v: Vec<u32> = (0..n).map(|_| (top + next() % range) as u32).collect();
+            let mut padded = vec![0xdead_beefu32; n + 34];
+            padded[17..17 + n].copy_from_slice(&v);
+            v.sort_unstable();
+            sort_times(&mut padded[17..17 + n], &mut tmp);
+            assert_eq!(&padded[17..17 + n], &v[..], "round {round}");
+            assert!(padded[..17].iter().chain(&padded[17 + n..]).all(|&x| x == 0xdead_beef), "round {round}");
+        }
+    }
+
+    /// The small click sort must order by time like the standard sort.
+    #[test]
+    fn sort_clicks_matches_std() {
+        let mut seed = 0x1357_2468_9bdf_ace0u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut tmp = Vec::new();
+        for round in 0..400_000u32 {
+            let n = if round % 64 == 7 { 2 + (next() % 3000) as usize } else { 2 + (next() % 30) as usize };
+            let range = match round % 3 {
+                0 => 3,
+                1 => 1000,
+                _ => 1u64 << 32,
+            };
+            let mut v: Vec<ClS> =
+                (0..n).map(|i| ClS { ts: (next() % range) as u32, camp: i as u32, idref: next() }).collect();
+            let mut w = v.clone();
+            sort_clicks(&mut v, &mut tmp);
+            assert!(v.windows(2).all(|x| x[0].ts <= x[1].ts), "round {round}");
+            let key = |c: &ClS| (c.ts, c.camp, c.idref);
+            let mut a: Vec<_> = v.iter().map(key).collect();
+            w.sort_unstable_by_key(key);
+            a.sort_unstable();
+            assert_eq!(a, w.iter().map(key).collect::<Vec<_>>(), "round {round}");
         }
     }
 
