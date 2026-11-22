@@ -29,32 +29,32 @@ impl ScanBuf {
     }
 }
 
-/// Marks the separator that ends each field holding a bad quote; `pending`
-/// says such a field ran past the previous word. Returns whether one runs
-/// past this word.
+/// Marks the separator that ends each field holding a bad quote, among the
+/// `popcnt(s)` separators whose flags are at `sf`. A field that runs past the
+/// word ends at the first separator after it, whose flag slot is `sf + k`;
+/// that slot is remembered in `*pend` and marked once its flag byte has been
+/// written (at a later call, or by `scan` at the end), because the flag store
+/// of the next word overwrites it.
 #[cold]
 #[inline(never)]
-unsafe fn mark_bad(sf: *mut u8, s: u64, mut badq: u64, pending: bool) -> bool {
-    let mut carry = false;
-    if pending {
-        if s != 0 {
-            *sf |= F_BAD;
-        } else {
-            carry = true;
-        }
+unsafe fn mark_bad(sf: *mut u8, s: u64, mut badq: u64, pend: *mut *mut u8) {
+    let end = sf.add(s.count_ones() as usize);
+    let pp = *pend;
+    if !pp.is_null() && pp < end {
+        *pp |= F_BAD;
+        *pend = std::ptr::null_mut();
     }
     while badq != 0 {
         let p = badq.trailing_zeros();
         badq &= badq - 1;
         let above = if p == 63 { 0 } else { s & (!0u64 << (p + 1)) };
         if above == 0 {
-            carry = true;
+            *pend = end;
         } else {
             let idx = (s & ((1u64 << above.trailing_zeros()) - 1)).count_ones() as usize;
             *sf.add(idx) |= F_BAD;
         }
     }
-    carry
 }
 
 /// Separator and quote masks of the 64 bytes at `p`, and the newline
@@ -87,8 +87,6 @@ struct Out {
     /// Separator and quote masks of the previous word (only bit 63 is used).
     ps: u64,
     pq: u64,
-    /// 1 when a field with a bad quote runs past the previous word.
-    pend: u64,
 }
 
 /// Records the separators of one word. `s`, `nm`, `qm`: separator, newline
@@ -96,7 +94,7 @@ struct Out {
 /// after the word is a separator, or a quote (other bits are ignored);
 /// `base`: the word's offset in all eight lanes.
 #[inline(always)]
-unsafe fn word(o: &mut Out, s: u64, nm: u64, qm: u64, xs: u64, xq: u64, base: __m256i) {
+unsafe fn word(o: &mut Out, s: u64, nm: u64, qm: u64, xs: u64, xq: u64, base: __m256i, pend: *mut *mut u8) {
     let after_sep = (s << 1) | (o.ps >> 63);
     let before_sep = (s >> 1) | (xs << 63);
     // Flag sources; pext with mask `s` looks only at separator bits.
@@ -138,8 +136,8 @@ unsafe fn word(o: &mut Out, s: u64, nm: u64, qm: u64, xs: u64, xq: u64, base: __
     // A quote is fine only right after a separator or right before one,
     // and not both (that field would be a single quote).
     let badq = qm & !(after_sep ^ before_sep);
-    if (badq | o.pend) != 0 {
-        o.pend = mark_bad(o.df, s, badq, o.pend != 0) as u64;
+    if badq != 0 {
+        mark_bad(o.df, s, badq, pend);
     }
     o.dp = o.dp.add(k);
     o.df = o.df.add(k);
@@ -177,7 +175,10 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
     *seps = u32::MAX;
     *sf = F_NL | if *text == b'"' { F_QA } else { 0 };
     // The byte before the block counts as a separator.
-    let mut o = Out { dp: seps.add(1), df: sf.add(1), ps: 1 << 63, pq: 0, pend: 0 };
+    let mut o = Out { dp: seps.add(1), df: sf.add(1), ps: 1 << 63, pq: 0 };
+    // Flag slot of a separator still to be marked F_BAD (see mark_bad).
+    let mut pend: *mut u8 = std::ptr::null_mut();
+    let pd: *mut *mut u8 = &mut pend;
     let comma = _mm256_set1_epi8(b',' as i8);
     let newline = _mm256_set1_epi8(b'\n' as i8);
     let quote = _mm256_set1_epi8(b'"' as i8);
@@ -195,11 +196,11 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
         while p < pairs {
             _mm_prefetch::<_MM_HINT_T0>(p.add(PREFETCH_AHEAD) as *const i8);
             let (s2, nm2, qm2) = masks(p.add(64), comma, newline, quote);
-            word(&mut o, s, nmask(nm), qm, s2, qm2, base);
+            word(&mut o, s, nmask(nm), qm, s2, qm2, base, pd);
             base = _mm256_add_epi32(base, step);
             _mm_prefetch::<_MM_HINT_T0>(p.add(PREFETCH_AHEAD + 64) as *const i8);
             let (s3, nm3, qm3) = masks(p.add(128), comma, newline, quote);
-            word(&mut o, s2, nmask(nm2), qm2, s3, qm3, base);
+            word(&mut o, s2, nmask(nm2), qm2, s3, qm3, base, pd);
             base = _mm256_add_epi32(base, step);
             s = s3;
             nm = nm3;
@@ -211,7 +212,7 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
             // hardware prefetcher starts over, and this covers the gap.
             _mm_prefetch::<_MM_HINT_T0>(p.add(PREFETCH_AHEAD) as *const i8);
             let (s2, nm2, qm2) = masks(p.add(64), comma, newline, quote);
-            word(&mut o, s, nmask(nm), qm, s2, qm2, base);
+            word(&mut o, s, nmask(nm), qm, s2, qm2, base, pd);
             s = s2;
             nm = nm2;
             qm = qm2;
@@ -226,10 +227,15 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
             let nb = *p.add(64);
             let xs = ((nb == b',') | (nb == b'\n')) as u64;
             let xq = (nb == b'"') as u64;
-            word(&mut o, s & keep, nmask(nm) & keep, qm & keep, xs, xq, base);
+            word(&mut o, s & keep, nmask(nm) & keep, qm & keep, xs, xq, base, pd);
         }
     }
     let ns = o.dp.offset_from(seps) as usize;
+    // A pending mark can only refer to a separator inside the block (the
+    // block ends with a newline); the bound keeps the old behaviour anyway.
+    if !pend.is_null() && pend < sf.add(ns) {
+        *pend |= F_BAD;
+    }
     sb.lines = count_nl(sf.add(1), sf.add(ns));
     for j in 0..16 {
         *seps.add(ns + j) = u32::MAX;
