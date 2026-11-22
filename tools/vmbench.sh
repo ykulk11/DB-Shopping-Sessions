@@ -81,7 +81,8 @@ import os, re, shutil, statistics, subprocess, time, resource
 W = os.environ["W"]; runs = int(os.environ["RUNS"]); sets = os.environ["SETS"].split()
 bins = [b.split("=", 1) for b in os.environ["BINS"].split()]
 extra = [v for v in os.environ["VARIANTS"].split(";") if v.strip()]
-variants = {"d20": ["", "PIPE_THREADS=4", "PIPE_NO_HUGE=1", "PIPE_POPULATE=1"], "d60": ["", "PIPE_NO_HUGE=1"]}
+variants = {"d20": ["", "PIPE_PIN=1", "PIPE_THREADS=4", "PIPE_NO_HUGE=1", "PIPE_POPULATE=1", "PIPE_BLOCK_KB=8", "PIPE_BLOCK_KB=16", "PIPE_BLOCK_KB=64"],
+            "d60": ["", "PIPE_PIN=1", "PIPE_NO_HUGE=1", "PIPE_PE_BITS=12", "PIPE_PE_BITS=13", "PIPE_BLOCK_KB=8"]}
 names = ["wall", "total", "setup", "phase1", "phase2", "phase3", "finish", "user", "sys"]
 print("%-18s %-4s %-22s %s  rows" % ("build", "set", "variant", " ".join("%7s" % n for n in names)))
 for ref, binary in bins:

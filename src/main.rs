@@ -26,7 +26,6 @@ use hash::{hash128, StaticTable};
 use sys::{Arena, Mapped};
 use ts::{BAD, DAY_MS};
 
-const BLOCK: usize = 32 << 10;
 const CHUNK: usize = 2 << 20;
 const GAP_MS: u32 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
@@ -161,6 +160,9 @@ struct Blk {
 /// `T` must be 8, 16 or 32 bytes.
 struct Wc<T: Copy> {
     wc: *mut u8,
+    /// Records waiting in each partition's buffer line. Kept apart from
+    /// `heads` so the common push touches only this small array and the line.
+    pos: Vec<u8>,
     heads: Vec<WcHead>,
     blocks: Vec<Blk>,
     /// 4 KB blocks no longer in use elsewhere, taken before new memory.
@@ -180,6 +182,7 @@ impl<T: Copy> Wc<T> {
         assert!(Self::SZ == 8 || Self::SZ == 16 || Self::SZ == 32);
         Wc {
             wc: arena.alloc(parts * 64, 4096),
+            pos: vec![0u8; parts],
             heads: vec![WcHead { cur: std::ptr::null_mut(), cnt: 0, last: u32::MAX }; parts],
             blocks: Vec::with_capacity(4096),
             spare: Vec::new(),
@@ -189,47 +192,59 @@ impl<T: Copy> Wc<T> {
 
     #[inline(always)]
     unsafe fn push(&mut self, arena: &mut Arena, part: usize, rec: T) {
+        let pos = self.pos.get_unchecked_mut(part);
+        let idx = *pos as u32;
+        let line = self.wc.add(part * 64);
+        std::ptr::write(line.add(idx as usize * Self::SZ) as *mut T, rec);
+        if idx == Self::PER_LINE - 1 {
+            *pos = 0;
+            self.flush_line(arena, part, line);
+        } else {
+            *pos = idx as u8 + 1;
+        }
+    }
+
+    /// Moves a full buffer line to the partition's current block.
+    #[inline(always)]
+    unsafe fn flush_line(&mut self, arena: &mut Arena, part: usize, line: *mut u8) {
         use std::arch::x86_64::*;
         let h = self.heads.get_unchecked_mut(part);
         let c = h.cnt;
-        let line = self.wc.add(part * 64);
-        let idx = c & (Self::PER_LINE - 1);
-        std::ptr::write(line.add(idx as usize * Self::SZ) as *mut T, rec);
-        h.cnt = c + 1;
-        if idx == Self::PER_LINE - 1 {
-            if (c / Self::PER_LINE) & 63 == 0 {
-                let b = match self.spare.pop() {
-                    Some(b) => b,
-                    None => arena.alloc(4096, 4096),
-                };
-                self.blocks.push(Blk { ptr: b, prev: h.last });
-                h.last = (self.blocks.len() - 1) as u32;
-                h.cur = b;
-            }
-            let a = _mm256_load_si256(line as *const __m256i);
-            let b = _mm256_load_si256(line.add(32) as *const __m256i);
-            _mm256_stream_si256(h.cur as *mut __m256i, a);
-            _mm256_stream_si256(h.cur.add(32) as *mut __m256i, b);
-            h.cur = h.cur.add(64);
+        if (c / Self::PER_LINE) & 63 == 0 {
+            let b = match self.spare.pop() {
+                Some(b) => b,
+                None => arena.alloc(4096, 4096),
+            };
+            self.blocks.push(Blk { ptr: b, prev: h.last });
+            h.last = (self.blocks.len() - 1) as u32;
+            h.cur = b;
         }
+        let a = _mm256_load_si256(line as *const __m256i);
+        let b = _mm256_load_si256(line.add(32) as *const __m256i);
+        _mm256_stream_si256(h.cur as *mut __m256i, a);
+        _mm256_stream_si256(h.cur.add(32) as *mut __m256i, b);
+        h.cur = h.cur.add(64);
+        h.cnt = c + Self::PER_LINE;
     }
 
     /// Writes out the partly filled lines. Call once, after the last push.
     unsafe fn finish(&mut self, arena: &mut Arena) {
         for part in 0..self.heads.len() {
+            let rem = self.pos[part] as u32;
             let h = &mut self.heads[part];
-            let rem = h.cnt & (Self::PER_LINE - 1);
             if rem != 0 {
                 if (h.cnt / Self::PER_LINE) & 63 == 0 {
                     let b = match self.spare.pop() {
-                    Some(b) => b,
-                    None => arena.alloc(4096, 4096),
-                };
+                        Some(b) => b,
+                        None => arena.alloc(4096, 4096),
+                    };
                     self.blocks.push(Blk { ptr: b, prev: h.last });
                     h.last = (self.blocks.len() - 1) as u32;
                     h.cur = b;
                 }
                 std::ptr::copy_nonoverlapping(self.wc.add(part * 64), h.cur, rem as usize * Self::SZ);
+                h.cnt += rem;
+                self.pos[part] = 0;
             }
         }
         std::arch::x86_64::_mm_sfence();
@@ -520,6 +535,18 @@ struct Shared {
     pe_bits: u32,
     /// Number of person partitions; a person's partition is `person >> PSHIFT`.
     np: usize,
+    /// Bytes of text scanned and parsed at a time.
+    block: usize,
+    /// CPUs to bind worker threads to; empty leaves placement to the kernel.
+    pin: Vec<usize>,
+}
+
+impl Shared {
+    fn pin(&self, tid: usize) {
+        if !self.pin.is_empty() {
+            sys::pin_to(self.pin[tid % self.pin.len()]);
+        }
+    }
 }
 
 /// Each person partition covers this many consecutive interned numbers (2^12).
@@ -956,7 +983,7 @@ unsafe fn phase1(sh: &Shared, tid: usize, threads: usize) -> P1 {
         let p = f.ptr;
         let mut pos = begin;
         while pos < fin {
-            let mut bend = (pos + BLOCK).min(fin);
+            let mut bend = (pos + sh.block).min(fin);
             if bend < fin {
                 bend = match scan::last_line_end(p, pos, bend) {
                     Some(e) => e,
@@ -1664,6 +1691,11 @@ fn manifest_time(text: &[u8], key: &[u8]) -> i64 {
     t
 }
 
+/// A number from the environment, for tuning runs.
+fn env_num(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default)
+}
+
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -1771,8 +1803,9 @@ fn main() {
 
     // Event partitions: about 16k rows each.
     let est_rows = bytes[KIND_EVENTS as usize] / 80;
+    let pe_max = env_num("PIPE_PE_BITS", 11).min(13) as u32;
     let mut pe_bits = 0u32;
-    while pe_bits < 11 && (est_rows >> pe_bits) > 16_384 {
+    while pe_bits < pe_max && (est_rows >> pe_bits) > 16_384 {
         pe_bits += 1;
     }
 
@@ -1811,6 +1844,8 @@ fn main() {
         intern: unsafe { Intern::new(cap) },
         pe_bits,
         np: (cap / 8 * 5) >> PSHIFT,
+        block: env_num("PIPE_BLOCK_KB", 32).clamp(4, 1024) << 10,
+        pin: if std::env::var("PIPE_PIN").is_ok() { sys::allowed_cpus() } else { Vec::new() },
     };
 
     // Phase 1, repeated with a larger ID table in the unlikely case it fills.
@@ -1818,7 +1853,14 @@ fn main() {
     loop {
         let shr = &sh;
         p1 = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..threads).map(|tid| s.spawn(move || unsafe { phase1(shr, tid, threads) })).collect();
+            let hs: Vec<_> = (0..threads)
+                .map(|tid| {
+                    s.spawn(move || {
+                        shr.pin(tid);
+                        unsafe { phase1(shr, tid, threads) }
+                    })
+                })
+                .collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         if !sh.intern.overflow.load(Ordering::Relaxed) {
@@ -1847,8 +1889,12 @@ fn main() {
     let shr = &sh;
     let p1r = &p1;
     std::thread::scope(|s| {
-        for _ in 0..pp.threads {
-            s.spawn(|| unsafe { phase2_dedup(shr, p1r, &next) });
+        let nextr = &next;
+        for tid in 0..pp.threads {
+            s.spawn(move || {
+                shr.pin(tid);
+                unsafe { phase2_dedup(shr, p1r, nextr) }
+            });
         }
     });
     let t_p2a = t0.elapsed();
@@ -1863,7 +1909,12 @@ fn main() {
     let p2: Vec<P2> = std::thread::scope(|s| {
         let nextr = &next;
         let hs: Vec<_> = (0..pp.threads)
-            .map(|tid| s.spawn(move || unsafe { phase2_scatter(shr, p1r, unitsr, nextr, tid) }))
+            .map(|tid| {
+                s.spawn(move || {
+                    shr.pin(tid);
+                    unsafe { phase2_scatter(shr, p1r, unitsr, nextr, tid) }
+                })
+            })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -1875,7 +1926,12 @@ fn main() {
     let nextr = &next;
     let p3: Vec<P3> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..pp.threads)
-            .map(|tid| s.spawn(move || unsafe { phase3(shr, p1r, p2r, nextr, pp, tid, out_ref) }))
+            .map(|tid| {
+                s.spawn(move || {
+                    shr.pin(tid);
+                    unsafe { phase3(shr, p1r, p2r, nextr, pp, tid, out_ref) }
+                })
+            })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
