@@ -537,6 +537,8 @@ struct Shared {
     np: usize,
     /// Bytes of text scanned and parsed at a time.
     block: usize,
+    /// Dedup splits partitions with more rows than this.
+    split_rows: usize,
     /// CPUs to bind worker threads to; empty leaves placement to the kernel.
     pin: Vec<usize>,
 }
@@ -1019,53 +1021,56 @@ unsafe impl Sync for P2 {}
 
 /// Phase 2a: dedup on event_id within event-hash partitions. Of the rows
 /// with one event_id, all but the one with the smallest ingest_ts are cleared.
-unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
-    let pe = 1usize << sh.pe_bits;
-    let mut table: Vec<u64> = Vec::new();
-    let mut pending: Vec<(u32, u64)> = Vec::new();
-    loop {
-        let item = next.fetch_add(1, Ordering::Relaxed);
-        if item >= pe {
-            break;
-        }
-        let total: usize = p1.iter().map(|t| t.fp.count(item)).sum();
-        if total == 0 {
-            continue;
-        }
-        // Between a quarter and half full.
-        let tsize = (total * 2).next_power_of_two().max(64);
-        if table.len() < tsize {
-            table = vec![0u64; tsize];
+/// The hash table of one dedup bucket: fingerprints, 0 for an empty slot.
+struct DedupTable {
+    slots: Vec<u64>,
+    mask: usize,
+    /// (slot, fingerprint) of rows that look like copies of an earlier one.
+    pending: Vec<(u32, u64)>,
+}
+
+impl DedupTable {
+    /// Empties the table and sizes it for `count` rows: a quarter to half full.
+    fn reset(&mut self, count: usize) {
+        let tsize = (count * 2).next_power_of_two().max(64);
+        if self.slots.len() < tsize {
+            self.slots = vec![0u64; tsize];
         } else {
-            table[..tsize].fill(0);
+            self.slots[..tsize].fill(0);
         }
-        let mask = tsize - 1;
-        let tab = table.as_mut_ptr();
-        pending.clear();
-        for t in p1 {
-            t.fp.for_each(item, |q| {
-                let fp = *q;
-                let tag = fp >> 32;
-                let mut i = (tag as usize) & mask;
-                loop {
-                    let s = *tab.add(i);
-                    if s == 0 {
-                        *tab.add(i) = fp;
-                        break;
-                    }
-                    if s >> 32 == tag {
-                        // Probably a copy of the same event. The rows are far away:
-                        // ask for them now and settle it after the partition.
-                        prefetch(row_ptr(p1, s as u32) as *const u8);
-                        prefetch(row_ptr(p1, fp as u32) as *const u8);
-                        pending.push((i as u32, fp));
-                        break;
-                    }
-                    i = (i + 1) & mask;
-                }
-            });
+        self.mask = tsize - 1;
+        self.pending.clear();
+    }
+
+    #[inline(always)]
+    unsafe fn insert(&mut self, p1: &[P1], fp: u64) {
+        let tab = self.slots.as_mut_ptr();
+        let tag = fp >> 32;
+        let mut i = (tag as usize) & self.mask;
+        loop {
+            let s = *tab.add(i);
+            if s == 0 {
+                *tab.add(i) = fp;
+                break;
+            }
+            if s >> 32 == tag {
+                // Probably a copy of the same event. The rows are far away:
+                // ask for them now and settle it after the bucket.
+                prefetch(row_ptr(p1, s as u32) as *const u8);
+                prefetch(row_ptr(p1, fp as u32) as *const u8);
+                self.pending.push((i as u32, fp));
+                break;
+            }
+            i = (i + 1) & self.mask;
         }
-        for &(at, fp) in pending.iter() {
+    }
+
+    /// Settles the pending rows: of two rows with the same event_id the one
+    /// with the smaller ingest_ts stays, the other gets its `tsv` cleared.
+    unsafe fn resolve(&mut self, p1: &[P1]) {
+        let tab = self.slots.as_mut_ptr();
+        let mask = self.mask;
+        for &(at, fp) in self.pending.iter() {
             let tag = fp >> 32;
             let mut i = at as usize;
             loop {
@@ -1078,7 +1083,6 @@ unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
                     let a = row_ptr(p1, s as u32);
                     let b = row_ptr(p1, fp as u32);
                     if (*a).h2 == (*b).h2 {
-                        // Same event_id: the smaller ingest_ts stays.
                         if (*b).ing < (*a).ing {
                             (*a).tsv = 0;
                             *tab.add(i) = fp;
@@ -1089,6 +1093,63 @@ unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
                     }
                 }
                 i = (i + 1) & mask;
+            }
+        }
+    }
+}
+
+unsafe fn phase2_dedup(sh: &Shared, p1: &[P1], next: &AtomicUsize) {
+    let pe = 1usize << sh.pe_bits;
+    let mut table = DedupTable { slots: Vec::new(), mask: 0, pending: Vec::new() };
+    let mut buckets: Vec<Vec<u64>> = Vec::new();
+    loop {
+        let item = next.fetch_add(1, Ordering::Relaxed);
+        if item >= pe {
+            break;
+        }
+        let total: usize = p1.iter().map(|t| t.fp.count(item)).sum();
+        if total == 0 {
+            continue;
+        }
+        if total <= sh.split_rows {
+            table.reset(total);
+            for t in p1 {
+                t.fp.for_each(item, |q| table.insert(p1, *q));
+            }
+            table.resolve(p1);
+            continue;
+        }
+        // A big partition: split it on the top bits of the tag (which neither
+        // the partition nor the table index uses) so each table stays in cache.
+        let mut bits = 1u32;
+        while bits < 6 && (total >> bits) > sh.split_rows {
+            bits += 1;
+        }
+        let nb = 1usize << bits;
+        if buckets.len() < nb {
+            buckets.resize_with(nb, Vec::new);
+        }
+        for b in buckets[..nb].iter_mut() {
+            b.clear();
+            b.reserve(total);
+        }
+        let bp = buckets.as_mut_ptr();
+        for t in p1 {
+            t.fp.for_each(item, |q| {
+                let fp = *q;
+                let b = &mut *bp.add((fp >> (64 - bits)) as usize);
+                let n = b.len();
+                *b.as_mut_ptr().add(n) = fp;
+                b.set_len(n + 1);
+            });
+        }
+        for b in buckets[..nb].iter() {
+            if !b.is_empty() {
+                table.reset(b.len());
+                for &fp in b.iter() {
+                    table.insert(p1, fp);
+                }
+                table.resolve(p1);
             }
         }
     }
@@ -1826,6 +1887,7 @@ fn main() {
         pe_bits,
         np: (cap / 8 * 5) >> PSHIFT,
         block: env_num("PIPE_BLOCK_KB", 32).clamp(4, 1024) << 10,
+        split_rows: env_num("PIPE_SPLIT_ROWS", 16_384).max(16),
         pin: if std::env::var("PIPE_PIN").is_ok() { sys::allowed_cpus() } else { Vec::new() },
     };
 
