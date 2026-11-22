@@ -2849,7 +2849,7 @@ fn main() {
 
     // Give the big mappings back in parallel while the last file is written:
     // otherwise the kernel tears them down on one core as the process exits.
-    let teardown = std::env::var("PIPE_NO_TEARDOWN").is_err();
+    let teardown = std::env::var("PIPE_TEARDOWN").is_ok();
     let tear_done = AtomicUsize::new(0);
     let tear_ref = &tear_done;
     std::thread::scope(|s| {
