@@ -419,6 +419,11 @@ impl Intern {
     #[cold]
     #[inline(never)]
     fn refill(&self, st: &mut InternLocal) -> bool {
+        // Once the table is full, stop counting: the counter must not wrap
+        // around and hand out numbers that are already in use.
+        if self.overflow.load(Ordering::Relaxed) {
+            return false;
+        }
         let start = self.next.fetch_add(ID_BLOCK, Ordering::Relaxed);
         if start as u64 + ID_BLOCK as u64 > self.limit as u64 {
             self.overflow.store(true, Ordering::Relaxed);
