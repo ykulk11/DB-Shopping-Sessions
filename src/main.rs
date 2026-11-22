@@ -712,31 +712,38 @@ unsafe fn product_number(p: *const u8, len: usize) -> Option<usize> {
 
 impl Products {
     fn new(rows: &[(&[u8], &[u8])], cat_of: impl Fn(&[u8]) -> u32) -> Self {
-        let mut table = StaticTable::new(rows.len());
+        let cats: Vec<u32> = rows.iter().map(|(_, cat)| cat_of(cat)).collect();
         let mut numbers = Vec::with_capacity(rows.len());
         let mut direct_ok = std::env::var("PIPE_NO_DIRECT").is_err();
-        for (id, cat) in rows {
-            let c = cat_of(cat);
+        for ((id, _), &c) in rows.iter().zip(&cats) {
             // The mapped file is readable well past any ID.
-            table.insert(unsafe { hash128(id.as_ptr(), id.len()) }, c);
             match unsafe { product_number(id.as_ptr(), id.len()) } {
                 Some(n) if c < 255 => numbers.push((n, c)),
-                _ => direct_ok = false,
+                _ => {
+                    direct_ok = false;
+                    break;
+                }
             }
         }
-        let mut direct = Vec::new();
         let top = numbers.iter().map(|x| x.0).max().unwrap_or(0);
         // Only for a dense catalog, where the byte table is the smaller one.
         if direct_ok && !numbers.is_empty() && top < rows.len() * 8 + 4096 {
-            direct = vec![0u8; top + 1];
+            let mut direct = vec![0u8; top + 1];
             for &(n, c) in &numbers {
                 // The first row for an ID counts, as in the hash table.
                 if direct[n] == 0 {
                     direct[n] = c as u8 + 1;
                 }
             }
+            // The byte table answers every lookup: the hash table (2 MB of
+            // fresh memory and a random insert per row) is never built.
+            return Products { direct, table: StaticTable::new(0) };
         }
-        Products { direct, table }
+        let mut table = StaticTable::new(rows.len());
+        for ((id, _), &c) in rows.iter().zip(&cats) {
+            table.insert(unsafe { hash128(id.as_ptr(), id.len()) }, c);
+        }
+        Products { direct: Vec::new(), table }
     }
 
     /// The category of a product ID, or `unknown`.
@@ -3742,9 +3749,13 @@ mod tests {
             cats[i]
         });
         assert!(!products.direct.is_empty(), "the direct table should be in use");
+        let mut oracle = StaticTable::new(rows.len());
+        for (r, &c) in rows.iter().zip(&cats) {
+            oracle.insert(unsafe { hash128(r.0.as_ptr(), r.0.len()) }, c);
+        }
         for &(at, len) in probes.iter().chain(catalog.iter().map(|c| &c.0)) {
             let p = unsafe { base.add(at) };
-            let want = match products.table.get(unsafe { hash128(p, len) }) {
+            let want = match oracle.get(unsafe { hash128(p, len) }) {
                 Some(c) => c,
                 None => 99,
             };
