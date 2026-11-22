@@ -1283,6 +1283,12 @@ unsafe fn phase1(sh: &Shared, tid: usize, threads: usize) -> P1 {
                 }
                 std::thread::yield_now();
             }
+            // The wait ended because the ID table filled up: this attempt is
+            // void and linking may still be running (its table holds marks
+            // that are not people yet), so no click may be filed.
+            if !sh.links_ready.load(Ordering::Acquire) {
+                break;
+            }
         }
         let f = &sh.files[ch.file as usize];
         let (begin, fin) = chunk_range(f, ch.k as usize);
