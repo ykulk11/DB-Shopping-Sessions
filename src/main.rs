@@ -14,6 +14,7 @@ mod parquet;
 mod scan;
 mod sys;
 mod ts;
+mod tune;
 
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -2050,7 +2051,7 @@ fn main() {
     let threads = std::env::var("PIPE_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from) / tune::THREAD_DIVISOR.max(1))
         .clamp(1, MAX_THREADS);
     if std::env::var("PIPE_TOUCH").is_ok() {
         sys::set_touch_only(true);
@@ -2058,7 +2059,8 @@ fn main() {
     if std::env::var("PIPE_POPULATE").is_ok() {
         sys::set_populate(true);
     }
-    if std::env::var("PIPE_NO_HUGE").is_ok() {
+    let set = |name: &str| std::env::var(name).is_ok();
+    if set("PIPE_NO_HUGE") || (!tune::HUGE && !set("PIPE_HUGE")) {
         sys::set_huge(false);
     }
 
@@ -2187,9 +2189,16 @@ fn main() {
         intern: unsafe { Intern::new(cap) },
         pe_bits,
         np: (cap / 8 * 5) >> PSHIFT,
-        block: env_num("PIPE_BLOCK_KB", 32).clamp(4, 1024) << 10,
+        block: env_num("PIPE_BLOCK_KB", tune::BLOCK_KB).clamp(4, 1024) << 10,
         split_rows: env_num("PIPE_SPLIT_ROWS", 16_384).max(16),
-        pin: if std::env::var("PIPE_PIN").is_ok() { sys::allowed_cpus() } else { Vec::new() },
+        pin: {
+            let cpus = sys::allowed_cpus();
+            if set("PIPE_PIN") || (tune::PIN && !set("PIPE_NO_PIN") && cpus.len() == threads) {
+                cpus
+            } else {
+                Vec::new()
+            }
+        },
     };
 
     // Phase 1, repeated with a larger ID table in the unlikely case it fills.
