@@ -122,7 +122,8 @@ unsafe fn date_slow(p: *const u8) -> i64 {
 pub unsafe fn datetime19c(p: *const u8, dc: &mut DateCache) -> i64 {
     let a = (p as *const u64).read_unaligned();
     let b = (p.add(7) as *const u32).read_unaligned();
-    let slot = (((b >> 8) & 3) << 4 | ((b >> 16) & 15)) as usize;
+    // The day-of-month digits' low bits (tens: 2 bits, ones: 4 bits) as a 6-bit slot.
+    let slot = _pext_u32(b, 0x000f_0300) as usize;
     let base = if *dc.a.get_unchecked(slot) == a && *dc.b.get_unchecked(slot) == b {
         *dc.base.get_unchecked(slot)
     } else {
@@ -135,19 +136,49 @@ pub unsafe fn datetime19c(p: *const u8, dc: &mut DateCache) -> i64 {
         *dc.base.get_unchecked_mut(slot) = base;
         base
     };
-    // "HH:MM:SS": digits become their values, the colons zero.
-    let x = (p.add(11) as *const u64).read_unaligned() ^ 0x3030_3a30_303a_3030;
-    if (x.wrapping_add(0x7676_7f76_767f_7676) | x) & 0x8080_8080_8080_8080 != 0 {
-        return BAD;
+    match time_of_day(p.add(11)) {
+        Some(sec) => base + sec,
+        None => BAD,
     }
+}
+
+/// `HH:MM:SS` (8 bytes) as seconds since midnight, or `None` unless every
+/// digit is an ASCII digit, both colons are present, and the values are in
+/// range. One check covers digits, separators and ranges; one multiply sums.
+#[inline(always)]
+unsafe fn time_of_day(p: *const u8) -> Option<i64> {
+    // Digits become their values, the colons zero, anything else fails the check.
+    let x = (p as *const u64).read_unaligned() ^ 0x3030_3a30_303a_3030;
+    // With every byte 0..=9 each byte of y is at most 99 and there are no carries:
+    // byte 0 = hours, byte 3 = minutes, byte 6 = seconds.
     let y = x.wrapping_mul(10).wrapping_add(x >> 8);
-    let hh = y & 0xff;
-    let mm = (y >> 24) & 0xff;
-    let ss = (y >> 48) & 0xff;
-    if hh > 23 || mm > 59 || ss > 59 {
-        return BAD;
+    let z = y & 0x00ff_0000_ff00_00ff;
+    // Adding 127 - limit to a value of at most 99 sets bit 7 exactly when the value
+    // exceeds the limit (23, 59, 59), without carrying out of the byte.
+    let bad = (x.wrapping_add(0x7676_7f76_767f_7676) | x | z.wrapping_add(0x0044_0000_4400_0068)) & 0x8080_8080_8080_8080;
+    if bad != 0 {
+        return None;
     }
-    base + (hh * 3600 + mm * 60 + ss) as i64
+    // z * (1 + 60 << 24 + 3600 << 48): bits 48..65 hold h * 3600 + m * 60 + s;
+    // the lower partial sums stay below bit 36 and the higher ones start at bit 72.
+    let m: u128 = 1 | (60 << 24) | (3600 << 48);
+    Some((((z as u128 * m) >> 48) as u64 & 0x3_ffff) as i64)
+}
+
+/// `HH:MM` (5 bytes, hours 0..=23, minutes 0..=59) as seconds, or `None`.
+/// Reads 8 bytes; the 3 after the field are ignored.
+#[inline(always)]
+unsafe fn offset(p: *const u8) -> Option<i64> {
+    let x = ((p as *const u64).read_unaligned() ^ 0x30_303a_3030) & 0xff_ffff_ffff;
+    // Byte 0 = hours, byte 3 = minutes; see `time_of_day`.
+    let y = x.wrapping_mul(10).wrapping_add(x >> 8);
+    let z = y & 0xff00_00ff;
+    let bad = (x.wrapping_add(0x76_767f_7676) | x | z.wrapping_add(0x4400_0068)) & 0x80_8080_8080;
+    if bad != 0 {
+        return None;
+    }
+    // z * (60 + 3600 << 24): bits 24..41 hold h * 3600 + m * 60, h * 60 stays below bit 11.
+    Some(((z.wrapping_mul(60 | (3600 << 24)) >> 24) & 0x3_ffff) as i64)
 }
 
 /// Form F1 only, as seconds since the epoch, or `BAD`.
@@ -195,19 +226,14 @@ pub unsafe fn parse_ts(p: *const u8, len: usize, dc: &mut DateCache) -> i64 {
     } else if len == 25 {
         let sign = *p.add(19);
         if sign == b'+' || sign == b'-' {
-            if *p.add(22) != b':' {
-                return BAD;
-            }
-            let hh = two(p.add(20));
-            let mm = two(p.add(23));
-            if hh > 23 || mm > 59 {
-                return BAD;
-            }
+            let off = match offset(p.add(20)) {
+                Some(off) => off,
+                None => return BAD,
+            };
             let s = datetime19c(p, dc);
             if s == BAD {
                 return BAD;
             }
-            let off = (hh * 3600 + mm * 60) as i64;
             return (if sign == b'+' { s - off } else { s + off }) * 1000;
         }
     }
@@ -374,6 +400,150 @@ mod tests {
         }
         assert_ne!(ts("2000-02-29T00:00:00Z"), BAD);
         assert_ne!(ts("2028-02-29T00:00:00Z"), BAD);
+    }
+
+    /// Scalar `HH:MM:SS` / `HH:MM` references for the SWAR fast paths.
+    fn tod_reference(b: &[u8]) -> Option<i64> {
+        let d = |i: usize| if b[i].is_ascii_digit() { Some((b[i] - b'0') as i64) } else { None };
+        if b[2] != b':' || b[5] != b':' {
+            return None;
+        }
+        let (h, m, s) = (d(0)? * 10 + d(1)?, d(3)? * 10 + d(4)?, d(6)? * 10 + d(7)?);
+        if h > 23 || m > 59 || s > 59 {
+            return None;
+        }
+        Some(h * 3600 + m * 60 + s)
+    }
+
+    fn offset_reference(b: &[u8]) -> Option<i64> {
+        let d = |i: usize| if b[i].is_ascii_digit() { Some((b[i] - b'0') as i64) } else { None };
+        if b[2] != b':' {
+            return None;
+        }
+        let (h, m) = (d(0)? * 10 + d(1)?, d(3)? * 10 + d(4)?);
+        if h > 23 || m > 59 {
+            return None;
+        }
+        Some(h * 3600 + m * 60)
+    }
+
+    #[test]
+    fn time_of_day_matches_reference() {
+        // Every two-digit hour, minute and second (0..=99 each).
+        for h in 0..100 {
+            for m in 0..100 {
+                for s in 0..100 {
+                    let t = format!("{h:02}:{m:02}:{s:02}");
+                    let buf = padded(t.as_bytes());
+                    assert_eq!(unsafe { time_of_day(buf.as_ptr().add(32)) }, tod_reference(t.as_bytes()), "{t}");
+                }
+            }
+        }
+        // Every offset with two-digit values.
+        for h in 0..100 {
+            for m in 0..100 {
+                let t = format!("{h:02}:{m:02}");
+                let buf = padded(t.as_bytes());
+                assert_eq!(unsafe { offset(buf.as_ptr().add(32)) }, offset_reference(t.as_bytes()), "{t}");
+            }
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Every byte value at every position of several bases, with random bytes after the field.
+        for base in ["00:00:00", "23:59:59", "19:09:09", "09:50:05", "12:34:56", "20:00:00", "24:60:60"] {
+            for at in 0..8 {
+                for v in 0..=255u8 {
+                    let mut t = base.as_bytes().to_vec();
+                    t[at] = v;
+                    let mut buf = padded(&t);
+                    buf[40] = next() as u8;
+                    assert_eq!(unsafe { time_of_day(buf.as_ptr().add(32)) }, tod_reference(&t), "{t:?}");
+                    // An offset is the first five bytes; what follows must not matter.
+                    for k in 5..8 {
+                        buf[32 + k] = next() as u8;
+                    }
+                    assert_eq!(unsafe { offset(buf.as_ptr().add(32)) }, offset_reference(&t), "offset {t:?}");
+                }
+            }
+        }
+        // Random strings over a digit-heavy alphabet, and fully random bytes.
+        let alphabet = b"0123456789:/;+- \x00\xff\x8a\x7f\x89\xb0";
+        for round in 0..3_000_000u32 {
+            let mut t = [0u8; 8];
+            for (i, c) in t.iter_mut().enumerate() {
+                *c = if round % 7 == 0 {
+                    next() as u8
+                } else if (i == 2 || i == 5) && next() % 8 != 0 {
+                    b':'
+                } else {
+                    alphabet[(next() % alphabet.len() as u64) as usize]
+                };
+            }
+            let mut buf = padded(&t);
+            buf[40] = next() as u8;
+            assert_eq!(unsafe { time_of_day(buf.as_ptr().add(32)) }, tod_reference(&t), "{t:?}");
+            assert_eq!(unsafe { offset(buf.as_ptr().add(32)) }, offset_reference(&t), "offset {t:?}");
+        }
+    }
+
+    /// The whole F2 form through `parse_ts`, against the scalar references.
+    #[test]
+    fn offset_form_matches_reference() {
+        let mut seed = 0xdead_beef_cafe_f00du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = b"0123456789-T:Z+ ";
+        let mut dc = DateCache::new();
+        let mut good = 0;
+        for round in 0..2_000_000u32 {
+            let mut s = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+                2025 + next() % 4,
+                1 + next() % 12,
+                1 + next() % 31,
+                next() % 25,
+                next() % 61,
+                next() % 61,
+                if next() % 2 == 0 { '+' } else { '-' },
+                next() % 26,
+                next() % 62
+            )
+            .into_bytes();
+            if round % 3 == 0 {
+                let at = (next() % 25) as usize;
+                s[at] = alphabet[(next() % alphabet.len() as u64) as usize];
+            }
+            if round % 50 == 0 {
+                s[(next() % 25) as usize] = next() as u8;
+            }
+            let mut buf = padded(&s);
+            for k in 0..8 {
+                buf[32 + 25 + k] = next() as u8;
+            }
+            let got = unsafe { parse_ts(buf.as_ptr().add(32), 25, &mut dc) };
+            // One mutation never makes 25 bytes all digits, so this is F2 or nothing.
+            assert!(!s.iter().all(|c| c.is_ascii_digit()));
+            let dt = reference(&s[..19]);
+            let want = match (s[19], offset_reference(&s[20..25])) {
+                (b'+', Some(off)) if dt != BAD => (dt - off) * 1000,
+                (b'-', Some(off)) if dt != BAD => (dt + off) * 1000,
+                _ => BAD,
+            };
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&s));
+            if got != BAD {
+                good += 1;
+            }
+        }
+        assert!(good > 100_000);
     }
 
     #[test]

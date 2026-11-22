@@ -4,7 +4,7 @@
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DATA=$1; NAME=$2
-OUT=/home/user/out/xcheck/$NAME
+OUT=${XOUT:-/home/user/out}/xcheck/$NAME
 rm -rf "$OUT"; mkdir -p "$OUT/pipe" "$OUT/ref"
 "$ROOT/target/release/pipeline" "$DATA" "$OUT/pipe"
 if [ ! -f "/home/user/out/refcache/$NAME/user_daily.csv" ]; then

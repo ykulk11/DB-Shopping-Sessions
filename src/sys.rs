@@ -13,6 +13,26 @@ extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     fn _exit(code: i32) -> !;
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+}
+
+/// The CPUs this process may run on, in ascending order.
+pub fn allowed_cpus() -> Vec<usize> {
+    let mut mask = [0u64; 16];
+    if unsafe { sched_getaffinity(0, 128, mask.as_mut_ptr()) } != 0 {
+        return Vec::new();
+    }
+    (0..1024).filter(|c| mask[c / 64] >> (c % 64) & 1 == 1).collect()
+}
+
+/// Binds the calling thread to one CPU. Failure is ignored.
+pub fn pin_to(cpu: usize) {
+    let mut mask = [0u64; 16];
+    if cpu < 1024 {
+        mask[cpu / 64] |= 1 << (cpu % 64);
+        unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
+    }
 }
 
 const PROT_READ: i32 = 1;
