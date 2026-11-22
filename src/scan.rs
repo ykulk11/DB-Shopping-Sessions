@@ -5,19 +5,28 @@ use std::arch::x86_64::*;
 
 /// Positions are byte offsets from the block start.
 pub struct ScanBuf {
-    /// `sep[0]` is a sentinel (`u32::MAX`, one before the block); then the
-    /// offset of every comma and newline in order.
-    pub sep: Vec<u32>,
-    /// For each newline: its index in `sep`.
-    pub nl: Vec<u32>,
-    /// For each newline: the number of double quotes before it in the block.
-    pub nlq: Vec<u32>,
+    /// Offset of every comma, in order, followed by at least 16 `u32::MAX`.
+    pub commas: Vec<u32>,
+    /// Offset of every newline, in order.
+    pub nls: Vec<u32>,
+    /// Per 64-byte word: bitmask of double quotes.
+    pub qw: Vec<u64>,
+    /// Per 64-byte word: number of double quotes before it in the block.
+    pub qcum: Vec<u32>,
     pub lines: usize,
 }
 
 impl ScanBuf {
     pub fn new() -> Self {
-        ScanBuf { sep: Vec::new(), nl: Vec::new(), nlq: Vec::new(), lines: 0 }
+        ScanBuf { commas: Vec::new(), nls: Vec::new(), qw: Vec::new(), qcum: Vec::new(), lines: 0 }
+    }
+
+    /// Number of double quotes before offset `at`.
+    #[inline(always)]
+    pub unsafe fn quotes_before(&self, at: u32) -> u32 {
+        let w = (at >> 6) as usize;
+        let below = (1u64 << (at & 63)) - 1;
+        *self.qcum.as_ptr().add(w) + (*self.qw.as_ptr().add(w) & below).count_ones()
     }
 }
 
@@ -25,18 +34,20 @@ impl ScanBuf {
 /// Reads up to 63 bytes past the end.
 #[inline(never)]
 pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
-    if sb.sep.capacity() < len + 80 {
-        sb.sep = Vec::with_capacity(len + 80);
-        sb.nl = Vec::with_capacity(len + 8);
-        sb.nlq = Vec::with_capacity(len + 8);
+    if sb.commas.capacity() < len + 96 {
+        sb.commas = Vec::with_capacity(len + 96 + len / 4);
+        sb.nls = Vec::with_capacity(len + 96 + len / 4);
+        sb.qw = Vec::with_capacity(len / 64 + 8 + len / 128);
+        sb.qcum = Vec::with_capacity(len / 64 + 8 + len / 128);
     }
-    let sep = sb.sep.as_mut_ptr();
-    let nl = sb.nl.as_mut_ptr();
-    let nlq = sb.nlq.as_mut_ptr();
-    *sep = u32::MAX;
-    let mut n = 1usize;
-    let mut k = 0usize;
+    let commas = sb.commas.as_mut_ptr();
+    let nls = sb.nls.as_mut_ptr();
+    let qw = sb.qw.as_mut_ptr();
+    let qcum = sb.qcum.as_mut_ptr();
+    let mut nc = 0usize;
+    let mut nn = 0usize;
     let mut q = 0u32;
+    let mut w = 0usize;
     let comma = _mm256_set1_epi8(b',' as i8);
     let newline = _mm256_set1_epi8(b'\n' as i8);
     let quote = _mm256_set1_epi8(b'"' as i8);
@@ -57,26 +68,55 @@ pub unsafe fn scan(text: *const u8, len: usize, sb: &mut ScanBuf) {
             nm &= keep;
             qm &= keep;
         }
-        let m = cm | nm;
-        let mut t = nm;
-        while t != 0 {
-            let below = (t & t.wrapping_neg()) - 1;
-            *nl.add(k) = (n as u32) + (m & below).count_ones();
-            *nlq.add(k) = q + (qm & below).count_ones();
-            k += 1;
-            t &= t - 1;
-        }
-        let base = i as u32;
-        let mut t = m;
-        while t != 0 {
-            *sep.add(n) = base + t.trailing_zeros();
-            n += 1;
-            t &= t - 1;
-        }
+        *qw.add(w) = qm;
+        *qcum.add(w) = q;
         q += qm.count_ones();
+        w += 1;
+        let base = i as u32;
+
+        // Commas: eight slots are written whether or not they are all used.
+        let cc = cm.count_ones() as usize;
+        let dst = commas.add(nc);
+        let mut t = cm;
+        for j in 0..8 {
+            *dst.add(j) = base + t.trailing_zeros();
+            t &= t.wrapping_sub(1);
+        }
+        if cc > 8 {
+            let mut j = 8;
+            while t != 0 {
+                *dst.add(j) = base + t.trailing_zeros();
+                t &= t - 1;
+                j += 1;
+            }
+        }
+        nc += cc;
+
+        // Newlines: two slots likewise.
+        let cn = nm.count_ones() as usize;
+        let dst = nls.add(nn);
+        let mut t = nm;
+        *dst = base + t.trailing_zeros();
+        t &= t.wrapping_sub(1);
+        *dst.add(1) = base + t.trailing_zeros();
+        t &= t.wrapping_sub(1);
+        if cn > 2 {
+            let mut j = 2;
+            while t != 0 {
+                *dst.add(j) = base + t.trailing_zeros();
+                t &= t - 1;
+                j += 1;
+            }
+        }
+        nn += cn;
         i += 64;
     }
-    sb.lines = k;
+    *qw.add(w) = 0;
+    *qcum.add(w) = q;
+    for j in 0..16 {
+        *commas.add(nc + j) = u32::MAX;
+    }
+    sb.lines = nn;
 }
 
 /// Offset of the first `\n` at or after `from`, or `len` when there is none.

@@ -40,14 +40,13 @@ const KIND_CLICKS: u8 = 2;
 // Records
 // ---------------------------------------------------------------------------
 
-/// One parsed event row, before dedup.
-#[repr(C, packed(4))]
+/// One parsed event row, before dedup. Exactly half a cache line.
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct EvRec {
-    /// Low half of the event_id hash.
+    /// The two halves of the event_id hash.
     h1: u64,
-    /// 32 more bits of the event_id hash.
-    h2: u32,
+    h2: u64,
     /// ingest_ts in seconds from a fixed base; `u32::MAX` when unparsable.
     ing: u32,
     /// Interned user ID (only meaningful when valid).
@@ -165,6 +164,110 @@ impl<T: Copy> Scatter<T> {
             }
             blk = *(blk as *const *mut u8);
             n = Self::PER;
+        }
+    }
+}
+
+/// Scatter for event records with one cache line of buffer per partition:
+/// two records fill a line, which then goes to its 4 KB block with
+/// non-temporal stores, so the destination is never read first.
+#[derive(Clone, Copy)]
+struct WcHead {
+    cur: *mut u8,
+    cnt: u32,
+    last: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Blk {
+    ptr: *mut u8,
+    prev: u32,
+}
+
+struct WcScatter {
+    wc: *mut u8,
+    heads: Vec<WcHead>,
+    blocks: Vec<Blk>,
+}
+
+unsafe impl Send for WcScatter {}
+unsafe impl Sync for WcScatter {}
+
+const WC_BLOCK_RECS: usize = 4096 / size_of::<EvRec>();
+
+impl WcScatter {
+    unsafe fn new(parts: usize, arena: &mut Arena) -> Self {
+        WcScatter {
+            wc: arena.alloc(parts * 64, 4096),
+            heads: vec![WcHead { cur: std::ptr::null_mut(), cnt: 0, last: u32::MAX }; parts],
+            blocks: Vec::with_capacity(4096),
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push(&mut self, arena: &mut Arena, part: usize, rec: *const EvRec) {
+        use std::arch::x86_64::*;
+        let h = self.heads.get_unchecked_mut(part);
+        let c = h.cnt;
+        let line = self.wc.add(part * 64);
+        let v = _mm256_loadu_si256(rec as *const __m256i);
+        h.cnt = c + 1;
+        if c & 1 == 0 {
+            _mm256_store_si256(line as *mut __m256i, v);
+        } else {
+            if (c >> 1) & 63 == 0 {
+                let b = arena.alloc(4096, 4096);
+                self.blocks.push(Blk { ptr: b, prev: h.last });
+                h.last = (self.blocks.len() - 1) as u32;
+                h.cur = b;
+            }
+            let a = _mm256_load_si256(line as *const __m256i);
+            _mm256_stream_si256(h.cur as *mut __m256i, a);
+            _mm256_stream_si256(h.cur.add(32) as *mut __m256i, v);
+            h.cur = h.cur.add(64);
+        }
+    }
+
+    /// Writes out the half-filled lines. Call once, after the last push.
+    unsafe fn finish(&mut self, arena: &mut Arena) {
+        for part in 0..self.heads.len() {
+            let h = &mut self.heads[part];
+            if h.cnt & 1 == 1 {
+                let c = h.cnt - 1;
+                if (c >> 1) & 63 == 0 {
+                    let b = arena.alloc(4096, 4096);
+                    self.blocks.push(Blk { ptr: b, prev: h.last });
+                    h.last = (self.blocks.len() - 1) as u32;
+                    h.cur = b;
+                }
+                std::ptr::copy_nonoverlapping(self.wc.add(part * 64), h.cur, 32);
+            }
+        }
+        std::arch::x86_64::_mm_sfence();
+    }
+
+    fn count(&self, part: usize) -> usize {
+        self.heads[part].cnt as usize
+    }
+
+    #[inline(always)]
+    unsafe fn for_each(&self, part: usize, mut f: impl FnMut(*mut EvRec)) {
+        let h = *self.heads.get_unchecked(part);
+        let total = h.cnt as usize;
+        if total == 0 {
+            return;
+        }
+        let nb = (total + WC_BLOCK_RECS - 1) / WC_BLOCK_RECS;
+        let mut n = total - (nb - 1) * WC_BLOCK_RECS;
+        let mut bi = h.last;
+        while bi != u32::MAX {
+            let b = *self.blocks.get_unchecked(bi as usize);
+            let base = b.ptr as *mut EvRec;
+            for i in 0..n {
+                f(base.add(i));
+            }
+            bi = b.prev;
+            n = WC_BLOCK_RECS;
         }
     }
 }
@@ -364,46 +467,88 @@ struct Shared {
     next_chunk: AtomicUsize,
     links_done: AtomicUsize,
     link_pairs: Mutex<Vec<Vec<(u32, u32)>>>,
+    /// Set once linked IDs are joined; clicks are parsed only after that.
+    links_ready: AtomicBool,
     intern: Intern,
     pe_bits: u32,
+    /// Number of person partitions; a person's partition is `person >> PSHIFT`.
+    np: usize,
 }
+
+/// Each person partition covers this many consecutive interned numbers (2^12).
+const PSHIFT: u32 = 12;
 
 // ---------------------------------------------------------------------------
 // Field splitting
 // ---------------------------------------------------------------------------
 
-/// Bounds of the `N` fields of a line whose separators are `sep[1..=N]`
-/// (`sep[0]` is the separator before the line). `ql` is the number of double
-/// quotes in the line. Returns false when a quote is anywhere except around a
-/// whole field.
-#[inline(always)]
-unsafe fn fields<const N: usize>(
-    text: *const u8,
-    sep: *const u32,
-    ql: u32,
-    fs: &mut [u32; N],
-    fe: &mut [u32; N],
-) -> bool {
-    if ql == 0 {
-        for j in 0..N {
-            fs[j] = (*sep.add(j)).wrapping_add(1);
-            fe[j] = *sep.add(j + 1);
+/// Walks the lines of a scanned block.
+struct LineIter {
+    k: usize,
+    ci: usize,
+    ls: u32,
+    qprev: u32,
+}
+
+impl LineIter {
+    fn new() -> Self {
+        LineIter { k: 0, ci: 0, ls: 0, qprev: 0 }
+    }
+
+    /// Advances to the next line (the caller checks `k < lines` first) and
+    /// fills the bounds of its `N` fields. Returns false when the line does
+    /// not have exactly `N` fields or has a double quote anywhere except
+    /// around a whole field.
+    #[inline(always)]
+    unsafe fn next<const N: usize>(
+        &mut self,
+        sb: &scan::ScanBuf,
+        text: *const u8,
+        fs: &mut [u32; N],
+        fe: &mut [u32; N],
+    ) -> bool {
+        let le = *sb.nls.as_ptr().add(self.k);
+        self.k += 1;
+        let qend = sb.quotes_before(le);
+        let ql = qend - self.qprev;
+        self.qprev = qend;
+        let ls = self.ls;
+        self.ls = le + 1;
+        let c = sb.commas.as_ptr().add(self.ci);
+        // Exactly N - 1 commas before the newline.
+        if !(*c.add(N - 2) < le && *c.add(N - 1) > le) {
+            let mut ci = self.ci;
+            while *sb.commas.as_ptr().add(ci) < le {
+                ci += 1;
+            }
+            self.ci = ci;
+            return false;
         }
-        return true;
+        self.ci += N - 1;
+        if ql == 0 {
+            fs[0] = ls;
+            for j in 1..N {
+                let at = *c.add(j - 1);
+                fe[j - 1] = at;
+                fs[j] = at + 1;
+            }
+            fe[N - 1] = le;
+            return true;
+        }
+        let mut total = 0u32;
+        let mut bad = 0u32;
+        for j in 0..N {
+            let s = if j == 0 { ls } else { *c.add(j - 1) + 1 };
+            let e = if j == N - 1 { le } else { *c.add(j) };
+            let q = (*text.add(s as usize) == b'"') as u32;
+            let closed = ((e - s >= 2) & (*text.offset(e as isize - 1) == b'"')) as u32;
+            bad |= q & (closed ^ 1);
+            fs[j] = s + q;
+            fe[j] = e - q;
+            total += q;
+        }
+        bad == 0 && total * 2 == ql
     }
-    let mut total = 0u32;
-    let mut bad = 0u32;
-    for j in 0..N {
-        let s = (*sep.add(j)).wrapping_add(1);
-        let e = *sep.add(j + 1);
-        let q = (*text.add(s as usize) == b'"') as u32;
-        let closed = ((e - s >= 2) & (*text.offset(e as isize - 1) == b'"')) as u32;
-        bad |= q & (closed ^ 1);
-        fs[j] = s + q;
-        fe[j] = e - q;
-        total += q;
-    }
-    bad == 0 && total * 2 == ql
 }
 
 #[inline(always)]
@@ -429,9 +574,12 @@ struct P1 {
     crecs: Vec<Click>,
     il: InternLocal,
     arena: Arena,
-    ev: Scatter<EvRec>,
+    ev: WcScatter,
+    /// Valid clicks by person partition.
     cl: Scatter<Click>,
     links: Vec<(u32, u32)>,
+    /// Seconds spent in: scan, parse, intern, scatter, linking, clicks, links.
+    tm: [f64; 7],
 }
 
 unsafe impl Send for P1 {}
@@ -475,11 +623,10 @@ unsafe fn chunk_range(f: &Mapped, k: usize) -> (usize, usize) {
 }
 
 unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
+    let t_a = Instant::now();
     scan::scan(text, len, &mut cx.sb);
+    let t_b = Instant::now();
     let lines = cx.sb.lines;
-    let sep = cx.sb.sep.as_ptr();
-    let nl = cx.sb.nl.as_ptr();
-    let nlq = cx.sb.nlq.as_ptr();
     if cx.recs.capacity() < lines {
         cx.recs = Vec::with_capacity(lines + lines / 2 + 16);
         cx.pend = Vec::with_capacity(lines + lines / 2 + 16);
@@ -488,44 +635,33 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let pend = cx.pend.as_mut_ptr();
     let mut nrec = 0usize;
     let mut npend = 0usize;
-    let mut prev_e = 0usize;
-    let mut prev_q = 0u32;
     let ws = sh.ws;
     let we = sh.we;
-    for k in 0..lines {
-        let e = *nl.add(k) as usize;
-        let qc = *nlq.add(k);
-        let nf = e - prev_e;
-        let ql = qc - prev_q;
-        let b = prev_e;
-        prev_e = e;
-        prev_q = qc;
-        if nf != 7 {
-            continue;
-        }
-        let mut fs = [0u32; 7];
-        let mut fe = [0u32; 7];
-        if !fields::<7>(text, sep.add(b), ql, &mut fs, &mut fe) {
+    let mut it = LineIter::new();
+    let mut fs = [0u32; 7];
+    let mut fe = [0u32; 7];
+    while it.k < lines {
+        if !it.next::<7>(&cx.sb, text, &mut fs, &mut fe) {
             continue;
         }
         let l0 = (fe[0] - fs[0]) as usize;
         if l0 == 0 {
             continue;
         }
-        let (h1, hh) = hash128(text.add(fs[0] as usize), l0);
+        let (h1, h2) = hash128(text.add(fs[0] as usize), l0);
         let l1 = (fe[1] - fs[1]) as usize;
         let t = ts::parse_ts(text.add(fs[2] as usize), (fe[2] - fs[2]) as usize);
         let ing = ts::parse_f1_seconds(text.add(fs[3] as usize), (fe[3] - fs[3]) as usize);
         let ty = event_type(text.add(fs[4] as usize), (fe[4] - fs[4]) as usize);
         let l5 = (fe[5] - fs[5]) as usize;
-        let mut valid = l1 != 0
-            && t != BAD
-            && t >= ws
-            && t < we
-            && ty != 0
-            && l5 != 0
-            && ing != BAD
-            && ing * 1000 - t <= DAY_MS;
+        let mut valid = (l1 != 0)
+            & (t != BAD)
+            & (t >= ws)
+            & (t < we)
+            & (ty != 0)
+            & (l5 != 0)
+            & (ing != BAD)
+            & (ing.wrapping_mul(1000).wrapping_sub(t) <= DAY_MS);
         let mut pc = 0u32;
         if valid && ty == 2 {
             let price = ts::parse_price(text.add(fs[6] as usize), (fe[6] - fs[6]) as usize);
@@ -545,7 +681,7 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
             (ing - sh.ing_base).clamp(0, u32::MAX as i64 - 1) as u32
         };
         let tsv = if valid { (t - ws) as u32 | VALID } else { 0 };
-        *recs.add(nrec) = EvRec { h1, h2: hh as u32, ing: ing_key, uidx: u32::MAX, tsv, pc };
+        *recs.add(nrec) = EvRec { h1, h2, ing: ing_key, uidx: u32::MAX, tsv, pc };
         if valid {
             let up = text.add(fs[1] as usize);
             let (lo, hi) = hash128(up, l1);
@@ -555,25 +691,30 @@ unsafe fn events_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         }
         nrec += 1;
     }
+    let t_c = Instant::now();
     for i in 0..npend {
         let p = *pend.add(i);
         let u = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
         (*recs.add(p.rec as usize)).uidx = u;
     }
+    let t_d = Instant::now();
     let shift = 24 - sh.pe_bits;
     for i in 0..nrec {
-        let r = *recs.add(i);
-        let part = ((r.h1 >> 40) as usize) >> shift;
+        let r = recs.add(i);
+        let part = (((*r).h1 >> 40) as usize) >> shift;
         cx.ev.push(&mut cx.arena, part, r);
     }
+    let t_e = Instant::now();
+    cx.tm[0] += (t_b - t_a).as_secs_f64();
+    cx.tm[1] += (t_c - t_b).as_secs_f64();
+    cx.tm[2] += (t_d - t_c).as_secs_f64();
+    cx.tm[3] += (t_e - t_d).as_secs_f64();
 }
 
 unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
+    let t_a = Instant::now();
     scan::scan(text, len, &mut cx.sb);
     let lines = cx.sb.lines;
-    let sep = cx.sb.sep.as_ptr();
-    let nl = cx.sb.nl.as_ptr();
-    let nlq = cx.sb.nlq.as_ptr();
     if cx.crecs.capacity() < lines {
         cx.crecs = Vec::with_capacity(lines + lines / 2 + 16);
     }
@@ -583,22 +724,11 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     let recs = cx.crecs.as_mut_ptr();
     let pend = cx.pend.as_mut_ptr();
     let mut n = 0usize;
-    let mut prev_e = 0usize;
-    let mut prev_q = 0u32;
-    for k in 0..lines {
-        let e = *nl.add(k) as usize;
-        let qc = *nlq.add(k);
-        let nf = e - prev_e;
-        let ql = qc - prev_q;
-        let b = prev_e;
-        prev_e = e;
-        prev_q = qc;
-        if nf != 4 {
-            continue;
-        }
-        let mut fs = [0u32; 4];
-        let mut fe = [0u32; 4];
-        if !fields::<4>(text, sep.add(b), ql, &mut fs, &mut fe) {
+    let mut it = LineIter::new();
+    let mut fs = [0u32; 4];
+    let mut fe = [0u32; 4];
+    while it.k < lines {
+        if !it.next::<4>(&cx.sb, text, &mut fs, &mut fe) {
             continue;
         }
         let l0 = (fe[0] - fs[0]) as usize;
@@ -630,38 +760,26 @@ unsafe fn clicks_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
     for i in 0..n {
         let p = *pend.add(i);
         let mut r = *recs.add(i);
-        r.who = sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref);
-        cx.cl.push(&mut cx.arena, 0, r);
+        r.who = sh.intern.person(sh.intern.get(&mut cx.il, p.lo, p.hi, p.idref));
+        cx.cl.push(&mut cx.arena, (r.who >> PSHIFT) as usize, r);
     }
+    cx.tm[5] += t_a.elapsed().as_secs_f64();
 }
 
 unsafe fn links_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
+    let t_a = Instant::now();
     scan::scan(text, len, &mut cx.sb);
     let lines = cx.sb.lines;
-    let sep = cx.sb.sep.as_ptr();
-    let nl = cx.sb.nl.as_ptr();
-    let nlq = cx.sb.nlq.as_ptr();
     if cx.pend.capacity() < lines * 2 {
         cx.pend = Vec::with_capacity(lines * 3 + 16);
     }
     let pend = cx.pend.as_mut_ptr();
     let mut n = 0usize;
-    let mut prev_e = 0usize;
-    let mut prev_q = 0u32;
-    for k in 0..lines {
-        let e = *nl.add(k) as usize;
-        let qc = *nlq.add(k);
-        let nf = e - prev_e;
-        let ql = qc - prev_q;
-        let b = prev_e;
-        prev_e = e;
-        prev_q = qc;
-        if nf != 2 {
-            continue;
-        }
-        let mut fs = [0u32; 2];
-        let mut fe = [0u32; 2];
-        if !fields::<2>(text, sep.add(b), ql, &mut fs, &mut fe) {
+    let mut it = LineIter::new();
+    let mut fs = [0u32; 2];
+    let mut fe = [0u32; 2];
+    while it.k < lines {
+        if !it.next::<2>(&cx.sb, text, &mut fs, &mut fe) {
             continue;
         }
         let l0 = (fe[0] - fs[0]) as usize;
@@ -688,6 +806,7 @@ unsafe fn links_block(sh: &Shared, cx: &mut P1, text: *const u8, len: usize) {
         }
         i += 2;
     }
+    cx.tm[6] += t_a.elapsed().as_secs_f64();
 }
 
 /// Joins linked IDs into people and names each person. Runs on one thread
@@ -734,16 +853,19 @@ unsafe fn link_people(sh: &Shared) {
 
 unsafe fn phase1(sh: &Shared) -> P1 {
     let pe = 1usize << sh.pe_bits;
+    let mut arena = Arena::new();
+    let ev = WcScatter::new(pe, &mut arena);
     let mut cx = P1 {
         sb: scan::ScanBuf::new(),
         recs: Vec::new(),
         pend: Vec::new(),
         crecs: Vec::new(),
         il: InternLocal { next: 0, end: 0 },
-        arena: Arena::new(),
-        ev: Scatter::new(pe),
-        cl: Scatter::new(1),
+        arena,
+        ev,
+        cl: Scatter::new(sh.np),
         links: Vec::new(),
+        tm: [0.0; 7],
     };
     loop {
         if sh.intern.overflow.load(Ordering::Relaxed) {
@@ -754,6 +876,15 @@ unsafe fn phase1(sh: &Shared) -> P1 {
             break;
         }
         let ch = sh.chunks[c];
+        if ch.kind == KIND_CLICKS {
+            // A click needs its person, so linking has to be finished.
+            while !sh.links_ready.load(Ordering::Acquire) {
+                if sh.intern.overflow.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
         let f = &sh.files[ch.file as usize];
         let (begin, fin) = chunk_range(f, ch.k as usize);
         let p = f.ptr;
@@ -777,10 +908,14 @@ unsafe fn phase1(sh: &Shared) -> P1 {
             let pairs = std::mem::take(&mut cx.links);
             sh.link_pairs.lock().unwrap().push(pairs);
             if sh.links_done.fetch_add(1, Ordering::AcqRel) + 1 == sh.n_link_chunks {
+                let t_a = Instant::now();
                 link_people(sh);
+                sh.links_ready.store(true, Ordering::Release);
+                cx.tm[4] += t_a.elapsed().as_secs_f64();
             }
         }
     }
+    cx.ev.finish(&mut cx.arena);
     cx
 }
 
@@ -791,46 +926,29 @@ unsafe fn phase1(sh: &Shared) -> P1 {
 #[derive(Clone, Copy)]
 struct Params {
     threads: usize,
-    /// Person partitions and the shift from a person number to its partition.
-    np: usize,
-    pshift: u32,
+    /// Person partitions that can hold anyone.
+    np_used: usize,
 }
 
 struct P2 {
     arena: Arena,
     ev: Scatter<PEv>,
     pu: Scatter<PPu>,
-    cl: Scatter<Click>,
 }
 
 unsafe impl Send for P2 {}
 unsafe impl Sync for P2 {}
 
-unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize, pp: Params) -> P2 {
-    let mut out = P2 {
-        arena: Arena::new(),
-        ev: Scatter::new(pp.np),
-        pu: Scatter::new(pp.np),
-        cl: Scatter::new(pp.np),
-    };
+unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize) -> P2 {
+    let mut out = P2 { arena: Arena::new(), ev: Scatter::new(sh.np), pu: Scatter::new(sh.np) };
     let pe = 1usize << sh.pe_bits;
     let mut table: Vec<u64> = Vec::new();
     const TAG: u64 = 0xffff_0000_0000_0000;
     const PTR: u64 = 0x0000_ffff_ffff_ffff;
     loop {
         let item = next.fetch_add(1, Ordering::Relaxed);
-        if item >= pe + p1.len() {
-            break;
-        }
         if item >= pe {
-            // One thread's clicks: resolve users to people and scatter.
-            let src = &p1[item - pe];
-            src.cl.for_each(0, |r| {
-                let mut c = *r;
-                c.who = sh.intern.person(c.who);
-                out.cl.push(&mut out.arena, (c.who >> pp.pshift) as usize, c);
-            });
-            continue;
+            break;
         }
         let total: usize = p1.iter().map(|t| t.ev.count(item)).sum();
         if total == 0 {
@@ -878,7 +996,7 @@ unsafe fn phase2(sh: &Shared, p1: &[P1], next: &AtomicUsize, pp: Params) -> P2 {
                 let tsv = (*r).tsv;
                 if tsv & VALID != 0 {
                     let person = sh.intern.person((*r).uidx);
-                    let part = (person >> pp.pshift) as usize;
+                    let part = (person >> PSHIFT) as usize;
                     let ts = tsv & !VALID;
                     out.ev.push(&mut out.arena, part, PEv { person, ts });
                     let pc = (*r).pc;
@@ -932,8 +1050,16 @@ unsafe fn click_id<'a>(c: &ClS) -> &'a [u8] {
     std::slice::from_raw_parts(c.idptr as *const u8, c.idlen as usize)
 }
 
-unsafe fn phase3(sh: &Shared, p2: &[P2], next: &AtomicUsize, pp: Params, tid: usize, out_dir: &Path) -> P3 {
-    let l = 1usize << pp.pshift;
+unsafe fn phase3(
+    sh: &Shared,
+    p1: &[P1],
+    p2: &[P2],
+    next: &AtomicUsize,
+    pp: Params,
+    tid: usize,
+    out_dir: &Path,
+) -> P3 {
+    let l = 1usize << PSHIFT;
     let mut cnt = vec![0u32; l + 1];
     let mut pos = vec![0u32; l + 1];
     let mut ccnt = vec![0u32; l + 1];
@@ -968,14 +1094,14 @@ unsafe fn phase3(sh: &Shared, p2: &[P2], next: &AtomicUsize, pp: Params, tid: us
     let week = WEEK_MS as u64;
     loop {
         let q = next.fetch_add(1, Ordering::Relaxed);
-        if q >= pp.np {
+        if q >= pp.np_used {
             break;
         }
         let n_ev: usize = p2.iter().map(|t| t.ev.count(q)).sum();
         if n_ev == 0 {
             continue;
         }
-        let base = (q << pp.pshift) as u32;
+        let base = (q << PSHIFT) as u32;
 
         // Group event times by person with a counting sort.
         cnt.fill(0);
@@ -1012,10 +1138,10 @@ unsafe fn phase3(sh: &Shared, p2: &[P2], next: &AtomicUsize, pp: Params, tid: us
             pus.sort_unstable_by_key(|x| x.0);
         }
 
-        let n_cl: usize = p2.iter().map(|t| t.cl.count(q)).sum();
+        let n_cl: usize = p1.iter().map(|t| t.cl.count(q)).sum();
         if n_cl > 0 {
             ccnt.fill(0);
-            for t in p2 {
+            for t in p1 {
                 t.cl.for_each(q, |r| {
                     *ccnt.get_unchecked_mut(((*r).who - base) as usize + 1) += 1;
                 });
@@ -1029,7 +1155,7 @@ unsafe fn phase3(sh: &Shared, p2: &[P2], next: &AtomicUsize, pp: Params, tid: us
             cbuf.clear();
             cbuf.reserve(n_cl);
             cbuf.set_len(n_cl);
-            for t in p2 {
+            for t in p1 {
                 t.cl.for_each(q, |r| {
                     let li = ((*r).who - base) as usize;
                     let at = *cpos.get_unchecked(li);
@@ -1282,23 +1408,11 @@ unsafe fn lookup_rows<'a>(m: &'a Mapped) -> Vec<(&'a [u8], &'a [u8])> {
     }
     let mut sb = scan::ScanBuf::new();
     scan::scan(text, len, &mut sb);
-    let sep = sb.sep.as_ptr();
-    let mut prev_e = 0usize;
-    let mut prev_q = 0u32;
-    for k in 0..sb.lines {
-        let e = *sb.nl.as_ptr().add(k) as usize;
-        let qc = *sb.nlq.as_ptr().add(k);
-        let nf = e - prev_e;
-        let ql = qc - prev_q;
-        let b = prev_e;
-        prev_e = e;
-        prev_q = qc;
-        if nf != 2 {
-            continue;
-        }
-        let mut fs = [0u32; 2];
-        let mut fe = [0u32; 2];
-        if !fields::<2>(text, sep.add(b), ql, &mut fs, &mut fe) {
+    let mut it = LineIter::new();
+    let mut fs = [0u32; 2];
+    let mut fe = [0u32; 2];
+    while it.k < sb.lines {
+        if !it.next::<2>(&sb, text, &mut fs, &mut fe) {
             continue;
         }
         rows.push((
@@ -1429,7 +1543,9 @@ fn main() {
         pe_bits += 1;
     }
 
-    let mut cap = ((bytes[KIND_EVENTS as usize] + bytes[KIND_CLICKS as usize]) / 400 + bytes[KIND_LINKS as usize] / 6)
+    // About 1 distinct user ID per 1,200 input bytes in generated data; the
+    // table gets four or more times that, and is rebuilt larger if it fills.
+    let mut cap = ((bytes[KIND_EVENTS as usize] + bytes[KIND_CLICKS as usize]) / 300 + bytes[KIND_LINKS as usize] / 16)
         .next_power_of_two()
         .max(1 << 18);
     if let Some(v) = std::env::var("PIPE_CAP_BITS").ok().and_then(|v| v.parse::<u32>().ok()) {
@@ -1458,8 +1574,10 @@ fn main() {
         next_chunk: AtomicUsize::new(0),
         links_done: AtomicUsize::new(0),
         link_pairs: Mutex::new(Vec::new()),
+        links_ready: AtomicBool::new(n_link_chunks == 0),
         intern: unsafe { Intern::new(cap) },
         pe_bits,
+        np: (cap / 2) >> PSHIFT,
     };
 
     // Phase 1, repeated with a larger ID table in the unlikely case it fills.
@@ -1481,22 +1599,22 @@ fn main() {
             sh.intern.free();
             sh.intern = Intern::new(cap);
         }
+        sh.np = (cap / 2) >> PSHIFT;
         sh.next_chunk.store(0, Ordering::Relaxed);
         sh.links_done.store(0, Ordering::Relaxed);
+        sh.links_ready.store(sh.n_link_chunks == 0, Ordering::Relaxed);
         sh.link_pairs.lock().unwrap().clear();
     }
     let t_p1 = t0.elapsed();
 
     let users = sh.intern.next.load(Ordering::Relaxed).min(sh.intern.limit) as usize;
-    let ubits = if users <= 1 { 0 } else { users.next_power_of_two().trailing_zeros() };
-    let pbits = ubits.saturating_sub(12).min(13);
-    let pp = Params { threads, np: 1usize << pbits, pshift: ubits - pbits };
+    let pp = Params { threads, np_used: users.div_ceil(1 << PSHIFT).min(sh.np) };
 
     let next = AtomicUsize::new(0);
     let shr = &sh;
     let p1r = &p1;
     let p2: Vec<P2> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..pp.threads).map(|_| s.spawn(|| unsafe { phase2(shr, p1r, &next, pp) })).collect();
+        let hs: Vec<_> = (0..pp.threads).map(|_| s.spawn(|| unsafe { phase2(shr, p1r, &next) })).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let t_p2 = t0.elapsed();
@@ -1507,7 +1625,7 @@ fn main() {
     let nextr = &next;
     let p3: Vec<P3> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..pp.threads)
-            .map(|tid| s.spawn(move || unsafe { phase3(shr, p2r, nextr, pp, tid, out_ref) }))
+            .map(|tid| s.spawn(move || unsafe { phase3(shr, p1r, p2r, nextr, pp, tid, out_ref) }))
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -1590,11 +1708,21 @@ fn main() {
     }
 
     if timing {
+        let mut tm = [0.0f64; 7];
+        for t in &p1 {
+            for i in 0..7 {
+                tm[i] += t.tm[i];
+            }
+        }
+        eprintln!(
+            "phase1 cpu ms: scan {:.0} parse {:.0} intern {:.0} scatter {:.0} link {:.0} clicks {:.0} links {:.0}",
+            tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, tm[6] * 1e3
+        );
         let t_end = t0.elapsed();
         eprintln!(
             "threads={threads} users={users} pe={} pp={} cap={cap} rows={total_rows}\nsetup {:.1} ms | phase1 {:.1} | phase2 {:.1} | phase3 {:.1} | finish {:.1} | total {:.1} ms",
             1usize << sh.pe_bits,
-            pp.np,
+            pp.np_used,
             t_setup.as_secs_f64() * 1e3,
             (t_p1 - t_setup).as_secs_f64() * 1e3,
             (t_p2 - t_p1).as_secs_f64() * 1e3,

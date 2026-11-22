@@ -1,17 +1,10 @@
 //! Exact timestamp and number parsing per rules.md.
 
+use std::arch::x86_64::*;
+
 pub const BAD: i64 = i64::MIN;
 
 pub const DAY_MS: i64 = 86_400_000;
-
-#[inline(always)]
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468
-}
 
 /// Two ASCII digits as a number, or a value over 99 when either is not a digit.
 #[inline(always)]
@@ -25,36 +18,64 @@ unsafe fn two(p: *const u8) -> u32 {
     }
 }
 
-static DAYS_IN_MONTH: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+static DIM: [[u8; 16]; 2] = [
+    [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0],
+    [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0],
+];
+static CUM: [[u16; 16]; 2] = [
+    [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 0, 0, 0],
+    [0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 0, 0, 0],
+];
+
+/// Four ASCII digits as a number, or `u32::MAX`.
+#[inline(always)]
+unsafe fn year4(p: *const u8) -> u32 {
+    let x = (p as *const u32).read_unaligned() ^ 0x3030_3030;
+    if (x.wrapping_add(0x7676_7676) | x) & 0x8080_8080 != 0 {
+        return u32::MAX;
+    }
+    let x = (x.wrapping_mul(10).wrapping_add(x >> 8)) & 0x00ff_00ff;
+    (x.wrapping_mul(100).wrapping_add(x >> 16)) & 0xffff
+}
 
 /// `YYYY-MM-DDTHH:MM:SS` (19 bytes) as seconds since the epoch, or `BAD`.
+/// Rejects anything that is not a real calendar date and time of day.
 #[inline(always)]
 pub unsafe fn datetime19(p: *const u8) -> i64 {
-    if *p.add(4) != b'-'
-        || *p.add(7) != b'-'
-        || *p.add(10) != b'T'
-        || *p.add(13) != b':'
-        || *p.add(16) != b':'
-    {
+    let y = year4(p);
+    // Bytes 3..19: the last year digit through the seconds.
+    let v = _mm_loadu_si128(p.add(3) as *const __m128i);
+    let pat = _mm_setr_epi8(
+        b'0' as i8, b'-' as i8, b'0' as i8, b'0' as i8, b'-' as i8, b'0' as i8, b'0' as i8, b'T' as i8,
+        b'0' as i8, b'0' as i8, b':' as i8, b'0' as i8, b'0' as i8, b':' as i8, b'0' as i8, b'0' as i8,
+    );
+    let lim = _mm_setr_epi8(9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9);
+    // A digit becomes its value, a matching separator 0, anything else exceeds the limit.
+    let t = _mm_xor_si128(v, pat);
+    let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(t, lim), lim));
+    let dg = _mm_shuffle_epi8(t, _mm_setr_epi8(2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1, -1, -1));
+    // 16-bit lanes: month, day, hour, minute, second.
+    let x = _mm_maddubs_epi16(dg, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
+    let hi = _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0);
+    let lo = _mm_setr_epi16(1, 1, 0, 0, 0, 0, 0, 0);
+    let out = _mm_movemask_epi8(_mm_or_si128(_mm_cmpgt_epi16(x, hi), _mm_cmpgt_epi16(lo, x)));
+    if ok != 0xffff || out != 0 || y == u32::MAX {
         return BAD;
     }
-    let y1 = two(p);
-    let y2 = two(p.add(2));
-    let mo = two(p.add(5));
-    let d = two(p.add(8));
-    let h = two(p.add(11));
-    let mi = two(p.add(14));
-    let s = two(p.add(17));
-    if y1 > 99 || y2 > 99 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 59 {
+    let sod = _mm_madd_epi16(x, _mm_setr_epi16(0, 0, 3600, 60, 1, 0, 0, 0));
+    let sec = (_mm_extract_epi32::<1>(sod) + _mm_extract_epi32::<2>(sod)) as i64;
+    let mo = (_mm_extract_epi16::<0>(x) & 15) as usize;
+    let d = _mm_extract_epi16::<1>(x) as u32;
+    let leap = ((y & 3 == 0) && (y % 25 != 0 || y & 15 == 0)) as usize;
+    if d > *DIM.get_unchecked(leap).get_unchecked(mo) as u32 {
         return BAD;
     }
-    let y = y1 * 100 + y2;
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let dim = *DAYS_IN_MONTH.get_unchecked(mo as usize) + (leap && mo == 2) as u32;
-    if d > dim {
-        return BAD;
-    }
-    days_from_civil(y as i64, mo as i64, d as i64) * 86_400 + (h * 3600 + mi * 60 + s) as i64
+    // Days from 0000-01-01 to the start of year y, then to 1970-01-01.
+    let days = (365 * y + (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400) as i64 - 719_528
+        + *CUM.get_unchecked(leap).get_unchecked(mo) as i64
+        + d as i64
+        - 1;
+    days * 86_400 + sec
 }
 
 /// Form F1 only, as seconds since the epoch, or `BAD`.
@@ -66,15 +87,40 @@ pub unsafe fn parse_f1_seconds(p: *const u8, len: usize) -> i64 {
     datetime19(p)
 }
 
+const ZEROS: u64 = 0x3030_3030_3030_3030;
+
+/// Whether all eight bytes of `x` (already XORed with `ZEROS`) are 0..=9.
+#[inline(always)]
+fn digits8(x: u64) -> bool {
+    (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 == 0
+}
+
+/// Eight digit values (first digit in the low byte) as a number.
+#[inline(always)]
+fn swar8(x: u64) -> u64 {
+    let x = (x.wrapping_mul(10).wrapping_add(x >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let x = (x.wrapping_mul(100).wrapping_add(x >> 16)) & 0x0000_ffff_0000_ffff;
+    (x.wrapping_mul(10_000).wrapping_add(x >> 32)) & 0xffff_ffff
+}
+
 /// Any of the three forms, as milliseconds since the epoch, or `BAD`. A
 /// digits-only value too large to be inside any window is also `BAD`.
 #[inline(always)]
 pub unsafe fn parse_ts(p: *const u8, len: usize) -> i64 {
-    if len == 20 && *p.add(19) == b'Z' {
-        let s = datetime19(p);
-        return if s == BAD { BAD } else { s * 1000 };
-    }
-    if len == 25 {
+    if len == 20 {
+        if *p.add(19) == b'Z' {
+            let s = datetime19(p);
+            return if s == BAD { BAD } else { s * 1000 };
+        }
+    } else if len == 13 {
+        // The usual F3: thirteen digits.
+        let a = (p as *const u64).read_unaligned() ^ ZEROS;
+        let b = (p.add(5) as *const u64).read_unaligned() ^ ZEROS;
+        if digits8(a) && digits8(b) {
+            return (swar8(a) * 100_000 + swar8(b & 0xffff_ffff_ff00_0000)) as i64;
+        }
+        return BAD;
+    } else if len == 25 {
         let sign = *p.add(19);
         if sign == b'+' || sign == b'-' {
             if *p.add(22) != b':' {
@@ -98,7 +144,7 @@ pub unsafe fn parse_ts(p: *const u8, len: usize) -> i64 {
 
 /// Digits only (leading zeros allowed) with at most `max_digits` significant
 /// digits, as a number; `BAD` otherwise, including the empty string.
-#[inline(always)]
+#[inline(never)]
 pub unsafe fn parse_digits(p: *const u8, len: usize, max_digits: usize) -> i64 {
     if len == 0 {
         return BAD;
@@ -108,7 +154,6 @@ pub unsafe fn parse_digits(p: *const u8, len: usize, max_digits: usize) -> i64 {
         i += 1;
     }
     if len - i > max_digits {
-        // Still has to be all digits to be well formed, but either way it is unusable.
         return BAD;
     }
     let mut v: i64 = 0;
@@ -131,5 +176,167 @@ pub unsafe fn parse_price(p: *const u8, len: usize) -> u32 {
         0
     } else {
         v as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let year = if month <= 2 { year - 1 } else { year };
+        let era = year.div_euclid(400);
+        let year_of_era = year - era * 400;
+        let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+        era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468
+    }
+
+    /// Plain scalar parse of the same 19 bytes, written independently.
+    fn reference(b: &[u8]) -> i64 {
+        let digit = |i: usize| -> Option<i64> { if b[i].is_ascii_digit() { Some((b[i] - b'0') as i64) } else { None } };
+        let num = |r: std::ops::Range<usize>| -> Option<i64> {
+            let mut v = 0;
+            for i in r {
+                v = v * 10 + digit(i)?;
+            }
+            Some(v)
+        };
+        if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+            return BAD;
+        }
+        let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) =
+            (num(0..4), num(5..7), num(8..10), num(11..13), num(14..16), num(17..19))
+        else {
+            return BAD;
+        };
+        if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+            return BAD;
+        }
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dim = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo as usize - 1];
+        if d > dim {
+            return BAD;
+        }
+        days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s
+    }
+
+    fn padded(s: &[u8]) -> Vec<u8> {
+        let mut v = vec![0u8; 32];
+        v.extend_from_slice(s);
+        v.extend_from_slice(&[0u8; 64]);
+        v
+    }
+
+    #[test]
+    fn datetime_matches_reference() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = b"0123456789-T:Z tz+./";
+        let mut good = 0;
+        for round in 0..3_000_000u32 {
+            let mut s = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                match next() % 6 { 0 => next() % 10000, 1 => 2028, 2 => 2100, 3 => 2000, _ => 2025 + next() % 4 },
+                next() % 14,
+                next() % 33,
+                next() % 26,
+                next() % 62,
+                next() % 62
+            )
+            .into_bytes();
+            if round % 3 == 0 {
+                let at = (next() % 19) as usize;
+                s[at] = alphabet[(next() % alphabet.len() as u64) as usize];
+            }
+            if round % 50 == 0 {
+                s[(next() % 19) as usize] = (next() % 256) as u8;
+            }
+            let buf = padded(&s);
+            let got = unsafe { datetime19(buf.as_ptr().add(32)) };
+            let want = reference(&s);
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&s));
+            if got != BAD {
+                good += 1;
+            }
+        }
+        assert!(good > 100_000);
+    }
+
+    #[test]
+    fn timestamp_forms() {
+        let ts = |s: &str| {
+            let buf = padded(s.as_bytes());
+            unsafe { parse_ts(buf.as_ptr().add(32), s.len()) }
+        };
+        assert_eq!(ts("2026-10-03T23:58:10Z"), 1_791_071_890_000);
+        assert_eq!(ts("2026-10-03T19:58:10-04:00"), 1_791_071_890_000);
+        assert_eq!(ts("1791071890000"), 1_791_071_890_000);
+        assert_eq!(ts("0001791071890000"), 1_791_071_890_000);
+        assert_eq!(ts("1791071890123"), 1_791_071_890_123);
+        assert_eq!(ts("86400000"), 86_400_000);
+        assert_eq!(ts("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(ts("2028-02-29T12:00:00Z"), 1_835_438_400_000);
+        assert_eq!(ts("2026-10-04T01:30:00+02:00"), ts("2026-10-03T23:30:00Z"));
+        assert_eq!(ts("2026-10-03T23:58:10-00:00"), 1_791_071_890_000);
+        assert_eq!(ts("2026-10-03T23:58:10+23:59"), 1_791_071_890_000 - (23 * 3600 + 59 * 60) * 1000);
+        for bad in [
+            "", "2026-10-03T23:58:10.000Z", "2026-10-03T23:58:10z", "2026-10-03t23:58:10Z",
+            "2026-10-03 23:58:10Z", "2026-10-03T23:58:10", "1791071890000.0", "1.79e12", "-5", "+5",
+            "2026-13-03T23:58:10Z", "2026-02-30T23:58:10Z", "2027-02-29T23:58:10Z", "2026-10-03T24:58:10Z",
+            "2026-10-03T23:58:60Z", "2026-10-03T23:60:10Z", "2026-10-03T23:58:10+24:00",
+            "2026-10-03T23:58:10+05:60", "2026-10-03T23:58:10+0200", "2026-00-03T23:58:10Z",
+            "2026-10-00T23:58:10Z", "2026-10-32T23:58:10Z", "2026-04-31T23:58:10Z", "179107189000a",
+            "17910718900 0", " 1791071890000", "999999999999999999999999999999", "2100-02-29T00:00:00Z",
+            "2026-10-03T23:58:10+02:0", "2026-10-03T23:58:10 02:00", "20261003T235810Z",
+        ] {
+            assert_eq!(ts(bad), BAD, "{bad:?}");
+        }
+        assert_ne!(ts("2000-02-29T00:00:00Z"), BAD);
+        assert_ne!(ts("2028-02-29T00:00:00Z"), BAD);
+    }
+
+    #[test]
+    fn digits_match_reference() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..2_000_000u32 {
+            let v = next() % 10_000_000_000_000;
+            let mut s = format!("{v:013}").into_bytes();
+            if round % 4 == 0 {
+                s[(next() % 13) as usize] = b"0123456789 .-+e/:"[(next() % 17) as usize];
+            }
+            let buf = padded(&s);
+            let got = unsafe { parse_ts(buf.as_ptr().add(32), 13) };
+            let want = match std::str::from_utf8(&s).ok().filter(|t| t.bytes().all(|c| c.is_ascii_digit())) {
+                Some(t) => t.parse::<i64>().unwrap(),
+                None => BAD,
+            };
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&s));
+        }
+    }
+
+    #[test]
+    fn prices() {
+        let price = |s: &str| {
+            let buf = padded(s.as_bytes());
+            unsafe { parse_price(buf.as_ptr().add(32), s.len()) }
+        };
+        assert_eq!(price("1"), 1);
+        assert_eq!(price("0250"), 250);
+        assert_eq!(price("10000000"), 10_000_000);
+        assert_eq!(price("000000000000000000001"), 1);
+        for bad in ["", "0", "00", "10000001", "250000000", "19.99", "-5", "+500", "1e3", "1000\r", " 5"] {
+            assert_eq!(price(bad), 0, "{bad:?}");
+        }
     }
 }
