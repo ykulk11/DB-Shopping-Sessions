@@ -70,7 +70,7 @@ struct RowStore {
 impl RowStore {
     /// Room for `n` consecutive rows: a pointer to the first and its number in this store.
     #[inline(always)]
-    unsafe fn reserve(&mut self, arena: &mut Arena, n: usize) -> (*mut Row, u32) {
+    unsafe fn reserve(&mut self, _arena: &mut Arena, n: usize) -> (*mut Row, u32) {
         let full = match self.chunks.last() {
             Some(&(_, used)) => used as usize + n > ROW_CHUNK,
             None => true,
@@ -79,7 +79,10 @@ impl RowStore {
             if n > ROW_CHUNK || self.chunks.len() == ROW_CHUNKS_MAX {
                 sys::die("row store limit exceeded");
             }
-            let p = arena.alloc(ROW_CHUNK * size_of::<Row>(), 4096) as *mut Row;
+            // Its own huge page per chunk, outside the arena: releasing a
+            // finished chunk after the scatter then frees exactly its pages,
+            // and no arena space is lost to alignment.
+            let p = sys::anon_huge(ROW_CHUNK * size_of::<Row>()) as *mut Row;
             self.chunks.push((p, 0));
         }
         let c = self.chunks.len() - 1;
@@ -1441,6 +1444,10 @@ unsafe fn phase2_scatter(sh: &Shared, p1: &[P1], units: &[(u32, u32)], next: &At
             pcur += 1;
             i += 1;
         }
+        // Nothing reads this chunk again (dedup is finished and each chunk is
+        // scattered once): return its pages, so that phase 3's allocations reuse
+        // them instead of fresh memory, which is costly on some VMs.
+        sys::discard(base as *mut u8, ROW_CHUNK * size_of::<Row>());
     }
     out.ev.finish(&mut out.arena);
     out.pu.finish(&mut out.arena);
@@ -2777,7 +2784,13 @@ fn main() {
             break;
         }
         for t in p1.iter_mut() {
-            unsafe { t.arena.release_all() };
+            unsafe {
+                t.arena.release_all();
+                // Row chunks have their own mappings (see RowStore::reserve).
+                for &(p, _) in &t.rows.chunks {
+                    sys::release(p as *mut u8, ROW_CHUNK * size_of::<Row>());
+                }
+            }
         }
         cap *= 4;
         unsafe {
