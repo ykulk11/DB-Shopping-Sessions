@@ -284,6 +284,14 @@ impl Intern {
         }
     }
 
+    /// Returns the tables to the kernel without touching the struct.
+    unsafe fn unmap(&self) {
+        sys::release(self.slots as *mut u8, self.bytes);
+        sys::release(self.id_ref as *mut u8, self.limit as usize * 8);
+        sys::release(self.penc as *mut u8, self.limit as usize * 4);
+        sys::release(self.name_enc as *mut u8, self.limit as usize * 4);
+    }
+
     unsafe fn free(&mut self) {
         sys::release(self.slots as *mut u8, self.bytes);
         sys::release(self.id_ref as *mut u8, self.limit as usize * 8);
@@ -1336,7 +1344,7 @@ fn radix_sort(v: &mut [u32], tmp: &mut Vec<u32>) {
         c1[((x >> 11) & 2047) as usize] += 1;
         c2[(x >> 22) as usize] += 1;
     }
-    let mut prefix = |c: &mut [u32]| {
+    let prefix = |c: &mut [u32]| {
         let mut acc = 0u32;
         for e in c.iter_mut() {
             let t = *e;
@@ -1519,6 +1527,9 @@ fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .max(1);
+    if std::env::var("PIPE_POPULATE").is_ok() {
+        sys::set_populate(true);
+    }
     if std::env::var("PIPE_NO_HUGE").is_ok() {
         sys::set_huge(false);
     }
@@ -1685,6 +1696,42 @@ fn main() {
     });
     let t_p3 = t0.elapsed();
 
+    // Give the big mappings back in parallel while the last file is written:
+    // otherwise the kernel tears them down on one core as the process exits.
+    let teardown = std::env::var("PIPE_NO_TEARDOWN").is_err();
+    let tear_done = AtomicUsize::new(0);
+    let tear_ref = &tear_done;
+    std::thread::scope(|s| {
+        if teardown {
+            for tid in 0..pp.threads {
+                s.spawn(move || unsafe {
+                    p1r[tid].arena.unmap_all();
+                    p2r[tid].arena.unmap_all();
+                    for (j, f) in shr.files.iter().enumerate() {
+                        if j % pp.threads == tid {
+                            f.unmap();
+                        }
+                    }
+                    if tid == 0 {
+                        shr.intern.unmap();
+                    }
+                    tear_ref.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        }
+        finish_outputs(shr, &p3, out_ref);
+    });
+    let _ = tear_done.load(Ordering::Relaxed);
+
+    if timing {
+        report(shr, &p1, &p3, threads, pp, cap, [t_setup, t_p1, t_p2, t_p3, t0.elapsed()]);
+    }
+    sys::exit_now(0);
+}
+
+/// Writes campaign_daily, and an empty user_daily file when there are no rows.
+fn finish_outputs(sh: &Shared, p3: &[P3], out_dir: &Path) {
+    let ndays = sh.ndays;
     // user_daily needs at least one file even with no rows.
     let total_rows: usize = p3.iter().map(|t| t.rows).sum();
     if total_rows == 0 {
@@ -1708,7 +1755,7 @@ fn main() {
     let mut purchasing = vec![0u64; cells];
     let mut assisted = vec![0u64; cells];
     let mut revenue = vec![0u64; cells];
-    for t in &p3 {
+    for t in p3 {
         for i in 0..cells {
             sessions[i] += t.agg.sessions[i] as u64;
             purchasing[i] += t.agg.purchasing[i] as u64;
@@ -1761,9 +1808,15 @@ fn main() {
         }
     }
 
-    if timing {
+}
+
+fn report(sh: &Shared, p1: &[P1], p3: &[P3], threads: usize, pp: Params, cap: usize, t: [std::time::Duration; 5]) {
+    let [t_setup, t_p1, t_p2, t_p3, t_end] = t;
+    let total_rows: usize = p3.iter().map(|t| t.rows).sum();
+    let users = sh.intern.next.load(Ordering::Relaxed);
+    {
         let mut tm = [0.0f64; 7];
-        for t in &p1 {
+        for t in p1 {
             for i in 0..7 {
                 tm[i] += t.tm[i];
             }
@@ -1773,7 +1826,7 @@ fn main() {
             tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, tm[6] * 1e3
         );
         let mut t3 = [0.0f64; 4];
-        for t in &p3 {
+        for t in p3 {
             for i in 0..4 {
                 t3[i] += t.tm[i];
             }
@@ -1782,7 +1835,6 @@ fn main() {
             "phase3 cpu ms: group {:.0} sort {:.0} sessions {:.0} write {:.0}",
             t3[0] * 1e3, t3[1] * 1e3, t3[2] * 1e3, t3[3] * 1e3
         );
-        let t_end = t0.elapsed();
         eprintln!(
             "threads={threads} users={users} pe={} pp={} cap={cap} rows={total_rows}\nsetup {:.1} ms | phase1 {:.1} | phase2 {:.1} | phase3 {:.1} | finish {:.1} | total {:.1} ms",
             1usize << sh.pe_bits,
@@ -1795,5 +1847,5 @@ fn main() {
             t_end.as_secs_f64() * 1e3
         );
     }
-    sys::exit_now(0);
 }
+

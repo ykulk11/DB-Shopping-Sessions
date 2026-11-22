@@ -22,6 +22,13 @@ const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MADV_HUGEPAGE: i32 = 14;
+const MAP_POPULATE: i32 = 0x8000;
+
+static mut POPULATE: bool = false;
+
+pub fn set_populate(on: bool) {
+    unsafe { POPULATE = on }
+}
 
 pub const PAGE: usize = 4096;
 const HUGE: usize = 2 << 20;
@@ -71,6 +78,17 @@ pub unsafe fn release(p: *mut u8, len: usize) {
     munmap(p as *mut c_void, len);
 }
 
+impl Mapped {
+    /// Unmaps the file's pages (the caller must not touch them afterwards).
+    pub unsafe fn unmap(&self) {
+        if self.len > 0 {
+            let start = (self.ptr as usize) & !(PAGE - 1);
+            let end = round_up(self.ptr as usize + self.len, PAGE);
+            munmap(start as *mut c_void, end - start);
+        }
+    }
+}
+
 static mut HUGE_ON: bool = true;
 
 pub fn set_huge(on: bool) {
@@ -112,7 +130,7 @@ pub fn map_file(path: &Path) -> Mapped {
             p as *mut c_void,
             len,
             PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_FIXED,
+            MAP_PRIVATE | MAP_FIXED | if POPULATE { MAP_POPULATE } else { 0 },
             file.as_raw_fd(),
             0,
         );
@@ -180,6 +198,13 @@ impl Arena {
         self.cur = a + size;
         self.end = p + want;
         a as *mut u8
+    }
+
+    /// Returns every chunk to the kernel; nothing allocated here may be used again.
+    pub unsafe fn unmap_all(&self) {
+        for &(p, len) in &self.chunks {
+            release(p as *mut u8, len);
+        }
     }
 
     pub unsafe fn release_all(&mut self) {

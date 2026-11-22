@@ -81,7 +81,8 @@ pub struct StaticTable {
 
 impl StaticTable {
     pub fn new(expected: usize) -> Self {
-        let cap = (expected.max(8) * 4).next_power_of_two();
+        // Load factor between a quarter and a half.
+        let cap = (expected.max(8) * 2).next_power_of_two();
         StaticTable {
             slots: vec![[0, 0]; cap],
             shift: 64 - cap.trailing_zeros(),
